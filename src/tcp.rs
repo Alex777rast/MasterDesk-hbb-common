@@ -1,4 +1,4 @@
-use crate::{bail, bytes_codec::BytesCodec, ResultType, config::Socks5Server, proxy::Proxy};
+use crate::{bail, bytes_codec::BytesCodec, config::Socks5Server, proxy::Proxy, ResultType};
 use anyhow::Context as AnyhowCtx;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -62,7 +62,10 @@ impl DerefMut for DynTcpStream {
     }
 }
 
-pub(crate) fn new_socket(addr: std::net::SocketAddr, reuse: bool) -> Result<TcpSocket, std::io::Error> {
+pub(crate) fn new_socket(
+    addr: std::net::SocketAddr,
+    reuse: bool,
+) -> Result<TcpSocket, std::io::Error> {
     let socket = match addr {
         std::net::SocketAddr::V4(..) => TcpSocket::new_v4()?,
         std::net::SocketAddr::V6(..) => TcpSocket::new_v6()?,
@@ -108,6 +111,35 @@ impl FramedStream {
             }
         }
         bail!(format!("Failed to connect to {remote_addr}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    pub async fn new_on_interface<T: ToSocketAddrs + std::fmt::Display>(
+        remote_addr: T,
+        local_addr: SocketAddr,
+        interface_index: u32,
+        ms_timeout: u64,
+    ) -> ResultType<Self> {
+        for remote_addr in lookup_host(&remote_addr).await? {
+            if !remote_addr.is_ipv4() || !local_addr.is_ipv4() {
+                continue;
+            }
+            let socket = new_socket(local_addr, true)?;
+            crate::direct_server::set_ipv4_unicast_interface(&socket, interface_index)?;
+            if let Ok(Ok(stream)) = super::timeout(ms_timeout, socket.connect(remote_addr)).await {
+                stream.set_nodelay(true).ok();
+                let addr = stream.local_addr()?;
+                return Ok(Self(
+                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                    addr,
+                    None,
+                    0,
+                ));
+            }
+        }
+        bail!(format!(
+            "Failed to connect to {remote_addr} on interface {interface_index}"
+        ));
     }
 
     pub async fn connect<'t, T>(

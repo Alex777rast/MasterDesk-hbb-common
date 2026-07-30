@@ -1,0 +1,9 @@
+MasterDesk hbb_common
+Copyright (C) 2026 MasterDesk contributors
+
+This repository is a modified fork of:
+https://github.com/rustdesk/hbb_common
+
+It is distributed as part of the MasterDesk modified RustDesk client under the
+GNU Affero General Public License, version 3. Upstream copyright notices and
+Git history are retained.

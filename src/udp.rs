@@ -14,7 +14,11 @@ pub enum FramedSocket {
     ProxySocks(Socks5UdpFramed),
 }
 
-fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, std::io::Error> {
+fn prepare_socket(
+    addr: SocketAddr,
+    reuse: bool,
+    buf_size: usize,
+) -> Result<Socket, std::io::Error> {
     let socket = match addr {
         SocketAddr::V4(..) => Socket::new(Domain::ipv4(), Type::dgram(), None),
         SocketAddr::V6(..) => Socket::new(Domain::ipv6(), Type::dgram(), None),
@@ -41,6 +45,22 @@ fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, 
     if addr.is_ipv6() && addr.ip().is_unspecified() && addr.port() > 0 {
         socket.set_only_v6(false).ok();
     }
+    Ok(socket)
+}
+
+fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, std::io::Error> {
+    let socket = prepare_socket(addr, reuse, buf_size)?;
+    socket.bind(&addr.into())?;
+    Ok(socket)
+}
+
+#[cfg(target_os = "windows")]
+fn new_socket_on_interface(
+    addr: SocketAddr,
+    interface_index: u32,
+) -> Result<Socket, std::io::Error> {
+    let socket = prepare_socket(addr, false, 0)?;
+    crate::direct_server::set_ipv4_unicast_interface(&socket, interface_index)?;
     socket.bind(&addr.into())?;
     Ok(socket)
 }
@@ -61,6 +81,14 @@ impl FramedSocket {
             .context("could not resolve to any address")?;
         Ok(Self::Direct(UdpFramed::new(
             UdpSocket::from_std(new_socket(addr, reuse, buf_size)?.into_udp_socket())?,
+            BytesCodec::new(),
+        )))
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn new_on_interface(addr: SocketAddr, interface_index: u32) -> ResultType<Self> {
+        Ok(Self::Direct(UdpFramed::new(
+            UdpSocket::from_std(new_socket_on_interface(addr, interface_index)?.into_udp_socket())?,
             BytesCodec::new(),
         )))
     }
@@ -168,4 +196,14 @@ impl FramedSocket {
         }
         None
     }
+}
+
+#[cfg(target_os = "windows")]
+pub fn new_udp_socket_on_interface(
+    addr: SocketAddr,
+    interface_index: u32,
+) -> ResultType<UdpSocket> {
+    Ok(UdpSocket::from_std(
+        new_socket_on_interface(addr, interface_index)?.into_udp_socket(),
+    )?)
 }

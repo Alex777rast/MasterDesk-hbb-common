@@ -8,9 +8,94 @@ use crate::{
     ResultType, Stream,
 };
 use anyhow::Context;
-use std::{net::SocketAddr, sync::Arc};
+#[cfg(target_os = "windows")]
+use futures::stream::{FuturesUnordered, StreamExt};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio_socks::{IntoTargetAddr, TargetAddr};
+
+#[cfg(target_os = "windows")]
+async fn direct_interfaces() -> ResultType<Vec<crate::direct_server::DirectInterface>> {
+    let interfaces = tokio::task::spawn_blocking(crate::direct_server::interfaces)
+        .await
+        .context("Direct-server bypass failed to enumerate Windows interfaces")?;
+    if interfaces.is_empty() {
+        anyhow::bail!(
+            "Direct-server bypass found no connected physical or external Hyper-V IPv4 interface with a gateway"
+        );
+    }
+    Ok(interfaces)
+}
+
+#[cfg(target_os = "windows")]
+async fn connect_tcp_direct_server(target: String, ms_timeout: u64) -> ResultType<FramedStream> {
+    let interfaces = direct_interfaces().await?;
+    let mut attempts = FuturesUnordered::new();
+    for interface in interfaces {
+        let target = target.clone();
+        attempts.push(async move {
+            let local_addr = SocketAddr::new(IpAddr::V4(interface.local_ip), 0);
+            let result =
+                FramedStream::new_on_interface(target, local_addr, interface.index, ms_timeout)
+                    .await;
+            (interface, result)
+        });
+    }
+
+    let mut failures = Vec::new();
+    while let Some((interface, result)) = attempts.next().await {
+        match result {
+            Ok(stream) => {
+                log::info!(
+                    "Direct-server bypass connected through direct interface '{}' (index {}, {})",
+                    interface.name,
+                    interface.index,
+                    interface.local_ip
+                );
+                return Ok(stream);
+            }
+            Err(err) => failures.push(format!(
+                "{} (index {}): {err}",
+                interface.name, interface.index
+            )),
+        }
+    }
+
+    anyhow::bail!(
+        "Direct-server bypass failed to connect to {target}: {}",
+        failures.join("; ")
+    )
+}
+
+#[cfg(target_os = "windows")]
+async fn direct_udp_route(
+    target: &str,
+) -> ResultType<Option<(crate::direct_server::DirectInterface, SocketAddr)>> {
+    if !crate::direct_server::is_target(target) {
+        return Ok(None);
+    }
+    let peer_addr = tokio::net::lookup_host(target)
+        .await?
+        .find(SocketAddr::is_ipv4)
+        .context(format!(
+            "Direct-server bypass failed to resolve an IPv4 address for {target}"
+        ))?;
+    let interface = direct_interfaces()
+        .await?
+        .into_iter()
+        .next()
+        .context("Direct-server bypass found no direct interface")?;
+    log::info!(
+        "Direct-server bypass selected direct interface '{}' (index {}, {}) for UDP",
+        interface.name,
+        interface.index,
+        interface.local_ip
+    );
+    Ok(Some((interface, peer_addr)))
+}
 
 #[inline]
 pub fn check_port<T: std::string::ToString>(host: T, port: i32) -> String {
@@ -155,6 +240,39 @@ pub async fn connect_tcp_local<
     local: Option<SocketAddr>,
     ms_timeout: u64,
 ) -> ResultType<Stream> {
+    let target_string = target.to_string();
+
+    #[cfg(target_os = "windows")]
+    if crate::direct_server::is_target(&target_string) {
+        return Ok(Stream::Tcp(
+            connect_tcp_direct_server(target_string, ms_timeout).await?,
+        ));
+    }
+
+    // A TCP hole-punch attempt reuses the physical local address of the
+    // server socket. Keep that peer socket on the same physical interface
+    // instead of allowing Windows to route it back through a TUN adapter.
+    #[cfg(target_os = "windows")]
+    if let Some(local_addr) = local {
+        let local_ip = local_addr.ip();
+        let interface = tokio::task::spawn_blocking(move || {
+            crate::direct_server::interface_for_local_ip(local_ip)
+        })
+        .await
+        .context("Direct-server bypass failed to inspect the local Windows interface")?;
+        if let Some(interface) = interface {
+            return Ok(Stream::Tcp(
+                FramedStream::new_on_interface(
+                    target_string,
+                    local_addr,
+                    interface.index,
+                    ms_timeout,
+                )
+                .await?,
+            ));
+        }
+    }
+
     if let Some(conf) = Config::get_socks() {
         return Ok(Stream::Tcp(
             FramedStream::connect(target, local, &conf, ms_timeout).await?,
@@ -217,6 +335,13 @@ async fn test_target(target: &str) -> ResultType<SocketAddr> {
 
 #[inline]
 pub async fn new_direct_udp_for(target: &str) -> ResultType<(Arc<UdpSocket>, SocketAddr)> {
+    #[cfg(target_os = "windows")]
+    if let Some((interface, peer_addr)) = direct_udp_route(target).await? {
+        let local_addr = SocketAddr::new(IpAddr::V4(interface.local_ip), 0);
+        let socket = crate::udp::new_udp_socket_on_interface(local_addr, interface.index)?;
+        return Ok((Arc::new(socket), peer_addr));
+    }
+
     let peer_addr = test_target(target).await?;
     let local_addr = Config::get_any_listen_addr(peer_addr.is_ipv4());
     let socket = UdpSocket::bind(local_addr).await?;
@@ -228,6 +353,15 @@ pub async fn new_udp_for(
     target: &str,
     ms_timeout: u64,
 ) -> ResultType<(FramedSocket, TargetAddr<'static>)> {
+    #[cfg(target_os = "windows")]
+    if let Some((interface, peer_addr)) = direct_udp_route(target).await? {
+        let local_addr = SocketAddr::new(IpAddr::V4(interface.local_ip), 0);
+        return Ok((
+            FramedSocket::new_on_interface(local_addr, interface.index)?,
+            peer_addr.into_target_addr()?.to_owned(),
+        ));
+    }
+
     let (ipv4, target) = if NetworkType::Direct == Config::get_network_type() {
         let addr = test_target(target).await?;
         (addr.is_ipv4(), addr.into_target_addr()?)
@@ -260,6 +394,15 @@ async fn new_udp<T: ToSocketAddrs>(local: T, ms_timeout: u64) -> ResultType<Fram
 pub async fn rebind_udp_for(
     target: &str,
 ) -> ResultType<Option<(FramedSocket, TargetAddr<'static>)>> {
+    #[cfg(target_os = "windows")]
+    if let Some((interface, peer_addr)) = direct_udp_route(target).await? {
+        let local_addr = SocketAddr::new(IpAddr::V4(interface.local_ip), 0);
+        return Ok(Some((
+            FramedSocket::new_on_interface(local_addr, interface.index)?,
+            peer_addr.into_target_addr()?.to_owned(),
+        )));
+    }
+
     if Config::get_network_type() != NetworkType::Direct {
         return Ok(None);
     }

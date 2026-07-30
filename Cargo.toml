@@ -81,12 +81,18 @@ clap = "4.5.51"
 webrtc = "0.14.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+network-interface = { package = "default-net", version = "0.14.1" }
 winapi = { version = "0.3", features = [
     "winuser",
     "synchapi",
     "pdh",
     "memoryapi",
     "sysinfoapi",
+    "ifdef",
+    "ipifcons",
+    "netioapi",
+    "winsock2",
+    "ws2def",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
