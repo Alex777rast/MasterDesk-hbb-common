@@ -1,9 +1,45 @@
 use crate::config::Config;
 use sodiumoxide::{base64, crypto::secretbox};
-use std::sync::{Arc, RwLock};
+use std::{
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
+
+/// MasterDesk keeps the temporary password stable for three hours so it can be
+/// shared with a technician without changing after every completed session.
+/// Manual refreshes and brute-force protection may still rotate it earlier.
+pub const TEMPORARY_PASSWORD_ROTATION_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
+
+struct TemporaryPasswordState {
+    value: String,
+    generated_at: Instant,
+}
+
+impl TemporaryPasswordState {
+    fn new() -> Self {
+        Self {
+            value: get_auto_password(),
+            generated_at: Instant::now(),
+        }
+    }
+
+    fn rotate(&mut self, now: Instant) {
+        self.value = get_auto_password();
+        self.generated_at = now;
+    }
+
+    fn rotate_if_due(&mut self, now: Instant) -> bool {
+        if !temporary_password_rotation_due(self.generated_at, now) {
+            return false;
+        }
+        self.rotate(now);
+        true
+    }
+}
 
 lazy_static::lazy_static! {
-    pub static ref TEMPORARY_PASSWORD:Arc<RwLock<String>> = Arc::new(RwLock::new(get_auto_password()));
+    static ref TEMPORARY_PASSWORD: Arc<RwLock<TemporaryPasswordState>> =
+        Arc::new(RwLock::new(TemporaryPasswordState::new()));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,14 +65,29 @@ fn get_auto_password() -> String {
     }
 }
 
+fn temporary_password_rotation_due(generated_at: Instant, now: Instant) -> bool {
+    now.checked_duration_since(generated_at)
+        .map(|elapsed| elapsed >= TEMPORARY_PASSWORD_ROTATION_INTERVAL)
+        .unwrap_or(false)
+}
+
 // Should only be called in server
 pub fn update_temporary_password() {
-    *TEMPORARY_PASSWORD.write().unwrap() = get_auto_password();
+    TEMPORARY_PASSWORD
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .rotate(Instant::now());
 }
 
 // Should only be called in server
 pub fn temporary_password() -> String {
-    TEMPORARY_PASSWORD.read().unwrap().clone()
+    let mut state = TEMPORARY_PASSWORD
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.rotate_if_due(Instant::now()) {
+        log::info!("Temporary password rotated after the three-hour MasterDesk interval");
+    }
+    state.value.clone()
 }
 
 fn verification_method() -> VerificationMethod {
@@ -392,6 +443,29 @@ mod test {
         test_speed(1024 * 1024, "1M");
         test_speed(10 * 1024 * 1024, "10M");
         test_speed(100 * 1024 * 1024, "100M");
+    }
+
+    #[test]
+    fn test_temporary_password_rotation_interval() {
+        use super::*;
+
+        let generated_at = Instant::now();
+        assert!(!temporary_password_rotation_due(
+            generated_at,
+            generated_at + TEMPORARY_PASSWORD_ROTATION_INTERVAL - Duration::from_secs(1)
+        ));
+        assert!(temporary_password_rotation_due(
+            generated_at,
+            generated_at + TEMPORARY_PASSWORD_ROTATION_INTERVAL
+        ));
+        assert!(temporary_password_rotation_due(
+            generated_at,
+            generated_at + TEMPORARY_PASSWORD_ROTATION_INTERVAL + Duration::from_secs(1)
+        ));
+        assert!(!temporary_password_rotation_due(
+            generated_at,
+            generated_at - Duration::from_secs(1)
+        ));
     }
 
     #[test]
