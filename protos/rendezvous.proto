@@ -4,6 +4,7 @@ package hbb;
 message RegisterPeer {
   string id = 1;
   int32 serial = 2;
+  DeviceLease lease = 3;
 }
 
 enum ConnType {
@@ -15,7 +16,24 @@ enum ConnType {
   TERMINAL = 5;
 }
 
-message RegisterPeerResponse { bool request_pk = 2; }
+message RegisterPeerResponse {
+  bool request_pk = 2;
+  IdentityRotation identity_rotation = 3;
+}
+
+message DeviceLease {
+  bytes installation_id = 1;
+  bytes session_nonce = 2;
+  int64 timestamp = 3;
+  bytes signature = 4;
+}
+
+message IdentityRotation {
+  bytes session_nonce = 1;
+  int64 issued_at = 2;
+  bytes nonce = 3;
+  bytes signature = 4;
+}
 
 message PunchHoleRequest { 
   string id = 1; 
@@ -28,6 +46,8 @@ message PunchHoleRequest {
   bool force_relay = 8;
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
+  string switch_code = 11;
+  RelayAuth relay_auth = 12;
 }
 
 message ControlPermissions {
@@ -63,6 +83,7 @@ message PunchHole {
   bytes socket_addr_v6 = 7;
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
+  RelayTicket relay_ticket = 10;
 }
 
 message TestNatRequest {
@@ -97,6 +118,7 @@ message RegisterPk {
   bytes pk = 3;
   string old_id = 4;
   bool no_register_device = 5;
+  DeviceLease lease = 6;
 }
 
 message RegisterPkResponse {
@@ -152,6 +174,34 @@ message RequestRelay {
   string token = 8;
   ControlPermissions control_permissions = 9;
   ControlledContext controlled_context = 10;
+  string switch_code = 11;
+  RelayAuth relay_auth = 12;
+  RelayTicket relay_ticket = 13;
+}
+
+message RelayAuth {
+  string requester_id = 1;
+  bytes session_nonce = 2;
+  int64 timestamp = 3;
+  bytes signature = 4;
+}
+
+message RelayTicket {
+  uint32 version = 1;
+  string key_id = 2;
+  string ticket_id = 3;
+  string relay_session_id = 4;
+  string role = 5;
+  string device_id = 6;
+  string controller_id = 7;
+  string controlled_id = 8;
+  string relay_server = 9;
+  int64 issued_at = 10;
+  int64 expires_at = 11;
+  ConnType conn_type = 12;
+  uint64 max_bytes = 13;
+  uint32 max_seconds = 14;
+  bytes signature = 15;
 }
 
 message RelayResponse {
@@ -167,6 +217,7 @@ message RelayResponse {
   int32 feedback = 9;
   bytes socket_addr_v6 = 10;
   int32 upnp_port = 11;
+  RelayTicket relay_ticket = 12;
 }
 
 message SoftwareUpdate { string url = 1; }
@@ -181,6 +232,7 @@ message FetchLocalAddr {
   bytes socket_addr_v6 = 3;
   ControlPermissions control_permissions = 4;
   ControlledContext controlled_context = 5;
+  RelayTicket relay_ticket = 6;
 }
 
 message LocalAddr {

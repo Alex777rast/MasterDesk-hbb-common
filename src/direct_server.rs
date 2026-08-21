@@ -55,6 +55,55 @@ pub fn is_target(target: &str) -> bool {
         .any(|configured| configured == target)
 }
 
+/// Replaces a configured direct-server hostname with the configured IPv4
+/// alias while preserving its port. This avoids depending on a VPN-controlled
+/// DNS path after the physical interface has explicitly been selected.
+///
+/// The replacement is intentionally enabled only when the direct-server list
+/// contains exactly one IPv4 alias. With zero or multiple aliases there is no
+/// unambiguous hostname-to-address mapping, so normal DNS resolution is kept.
+fn resolved_target_from_config(target: &str, configured: &str) -> Option<String> {
+    let Some(target_host) = normalized_host(target) else {
+        return None;
+    };
+    if !configured
+        .split(',')
+        .filter_map(normalized_host)
+        .any(|configured| configured == target_host)
+    {
+        return None;
+    }
+
+    let mut aliases = configured
+        .split(',')
+        .filter_map(normalized_host)
+        .filter_map(|host| host.parse::<Ipv4Addr>().ok())
+        .collect::<Vec<_>>();
+    aliases.sort_unstable();
+    aliases.dedup();
+    if aliases.len() != 1 {
+        return None;
+    }
+
+    if target_host.parse::<Ipv4Addr>().is_ok() {
+        return Some(target.to_owned());
+    }
+
+    let alias = aliases[0];
+    match target.rsplit_once(':') {
+        Some((_, port)) if port.parse::<u16>().is_ok() => Some(format!("{alias}:{port}")),
+        Some(_) => None,
+        None => Some(alias.to_string()),
+    }
+}
+
+pub fn resolved_target(target: &str) -> Option<String> {
+    resolved_target_from_config(
+        target,
+        &Config::get_option(keys::OPTION_FORCE_DIRECT_SERVER),
+    )
+}
+
 #[cfg(target_os = "windows")]
 fn is_hyper_v_external_ethernet(description: Option<&str>) -> bool {
     description.map_or(false, |description| {
@@ -182,6 +231,34 @@ mod tests {
         assert!(is_target("176.123.167.146:21117"));
         assert!(!is_target("176.123.167.147:21116"));
         assert!(!is_target("example.com:21116"));
+    }
+
+    #[test]
+    fn resolves_configured_hostnames_to_the_single_ipv4_alias() {
+        let configured = "hbbs.masterdesk.online,hbbr.masterdesk.online,176.123.167.146";
+
+        assert_eq!(
+            resolved_target_from_config("hbbs.masterdesk.online:21116", configured),
+            Some("176.123.167.146:21116".to_owned())
+        );
+        assert_eq!(
+            resolved_target_from_config("hbbr.masterdesk.online:21117", configured),
+            Some("176.123.167.146:21117".to_owned())
+        );
+        assert_eq!(
+            resolved_target_from_config("example.com:21116", configured),
+            None
+        );
+    }
+
+    #[test]
+    fn leaves_dns_in_control_when_the_ipv4_alias_is_ambiguous() {
+        let configured = "hbbs.masterdesk.online,176.123.167.146,176.123.167.147";
+
+        assert_eq!(
+            resolved_target_from_config("hbbs.masterdesk.online:21116", configured),
+            None
+        );
     }
 
     #[cfg(target_os = "windows")]

@@ -33,9 +33,16 @@ async fn direct_interfaces() -> ResultType<Vec<crate::direct_server::DirectInter
 #[cfg(target_os = "windows")]
 async fn connect_tcp_direct_server(target: String, ms_timeout: u64) -> ResultType<FramedStream> {
     let interfaces = direct_interfaces().await?;
+    let resolved_target =
+        crate::direct_server::resolved_target(&target).unwrap_or_else(|| target.clone());
+    if resolved_target != target {
+        log::info!(
+            "Direct-server bypass resolved {target} to compiled IPv4 alias {resolved_target}"
+        );
+    }
     let mut attempts = FuturesUnordered::new();
     for interface in interfaces {
-        let target = target.clone();
+        let target = resolved_target.clone();
         attempts.push(async move {
             let local_addr = SocketAddr::new(IpAddr::V4(interface.local_ip), 0);
             let result =
@@ -77,7 +84,9 @@ async fn direct_udp_route(
     if !crate::direct_server::is_target(target) {
         return Ok(None);
     }
-    let peer_addr = tokio::net::lookup_host(target)
+    let resolved_target =
+        crate::direct_server::resolved_target(target).unwrap_or_else(|| target.to_owned());
+    let peer_addr = tokio::net::lookup_host(&resolved_target)
         .await?
         .find(SocketAddr::is_ipv4)
         .context(format!(

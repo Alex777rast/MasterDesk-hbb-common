@@ -1,6 +1,7 @@
 use crate::{
     config::{
-        keys::OPTION_RELAY_SERVER, use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
+        keys::{OPTION_FORCE_SECURE_WEBSOCKET, OPTION_RELAY_SERVER},
+        use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
     },
     protobuf::Message,
     socket_client::split_host_port,
@@ -9,21 +10,27 @@ use crate::{
     tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
 };
-use anyhow::bail;
+use anyhow::{bail, Context};
 use async_recursion::async_recursion;
 use bytes::{Bytes, BytesMut};
+#[cfg(target_os = "windows")]
+use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt};
+#[cfg(target_os = "windows")]
+use std::net::IpAddr;
 use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
+#[cfg(target_os = "windows")]
+use tokio::net::TcpSocket;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_native_tls::native_tls::TlsConnector;
 use tokio_tungstenite::{
-    connect_async_tls_with_config, tungstenite::protocol::Message as WsMessage, Connector,
-    MaybeTlsStream, WebSocketStream,
+    client_async_tls_with_config, connect_async_tls_with_config,
+    tungstenite::protocol::Message as WsMessage, Connector, MaybeTlsStream, WebSocketStream,
 };
 use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::Role;
@@ -65,6 +72,82 @@ impl WsFramedStream {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    async fn connect_direct_server(url: &str, ms_timeout: u64) -> ResultType<Option<TcpStream>> {
+        let parsed = url::Url::parse(url).context("Invalid WebSocket URL")?;
+        let Some(host) = parsed.host_str() else {
+            return Ok(None);
+        };
+        let Some(port) = parsed.port_or_known_default() else {
+            return Ok(None);
+        };
+        let target = format!("{host}:{port}");
+        if !crate::direct_server::is_target(&target) {
+            return Ok(None);
+        }
+
+        let resolved_target = crate::direct_server::resolved_target(&target)
+            .context("Direct WebSocket target has no compiled IPv4 alias")?;
+        let remote_addr = tokio::net::lookup_host(&resolved_target)
+            .await?
+            .find(SocketAddr::is_ipv4)
+            .context("Direct WebSocket target did not resolve to IPv4")?;
+        let interfaces = tokio::task::spawn_blocking(crate::direct_server::interfaces)
+            .await
+            .context("Direct WebSocket routing failed to enumerate Windows interfaces")?;
+        if interfaces.is_empty() {
+            bail!(
+                "Direct WebSocket routing found no connected physical or external Hyper-V IPv4 interface with a gateway"
+            );
+        }
+
+        let mut attempts = FuturesUnordered::new();
+        for interface in interfaces {
+            attempts.push(async move {
+                let local_addr = SocketAddr::new(IpAddr::V4(interface.local_ip), 0);
+                let result: ResultType<TcpStream> = async {
+                    let socket = TcpSocket::new_v4()?;
+                    socket.bind(local_addr)?;
+                    crate::direct_server::set_ipv4_unicast_interface(&socket, interface.index)?;
+                    let stream = timeout(
+                        Duration::from_millis(ms_timeout),
+                        socket.connect(remote_addr),
+                    )
+                    .await
+                    .context("Direct WebSocket TCP connection timed out")??;
+                    stream.set_nodelay(true)?;
+                    Ok(stream)
+                }
+                .await;
+                (interface, result)
+            });
+        }
+
+        let mut failures = Vec::new();
+        while let Some((interface, result)) = attempts.next().await {
+            match result {
+                Ok(stream) => {
+                    log::info!(
+                        "Direct WebSocket connected to {target} through '{}' (index {}, {})",
+                        interface.name,
+                        interface.index,
+                        interface.local_ip
+                    );
+                    return Ok(Some(stream));
+                }
+                Err(err) => failures.push(format!(
+                    "{} (index {}): {err}",
+                    interface.name, interface.index
+                )),
+            }
+        }
+
+        bail!(
+            "Direct WebSocket failed to connect to {resolved_target}: {}",
+            failures.join("; ")
+        )
+    }
+
     async fn connect(
         url: &str,
         ms_timeout: u64,
@@ -102,12 +185,29 @@ impl WsFramedStream {
             .map_err(|e| Error::new(ErrorKind::Other, e))?;
         let connector =
             Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false))?;
-        match timeout(
+        #[cfg(target_os = "windows")]
+        let connect_result =
+            if let Some(stream) = Self::connect_direct_server(url, ms_timeout).await? {
+                timeout(
+                    Duration::from_millis(ms_timeout),
+                    client_async_tls_with_config(request, stream, ws_config, connector),
+                )
+                .await?
+            } else {
+                timeout(
+                    Duration::from_millis(ms_timeout),
+                    connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
+                )
+                .await?
+            };
+        #[cfg(not(target_os = "windows"))]
+        let connect_result = timeout(
             Duration::from_millis(ms_timeout),
             connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
         )
-        .await?
-        {
+        .await?;
+
+        match connect_result {
             Ok((ws_stream, _)) => {
                 upsert_tls_cache(url, tls_type, danger_accept_invalid_cert.unwrap_or(false));
                 Ok(ws_stream)
@@ -388,8 +488,9 @@ pub fn check_ws(endpoint: &str) -> String {
         (format!("{}{}", endpoint_host, domain_path), true)
     };
     let protocol = if is_domain {
+        let force_secure = Config::get_option(OPTION_FORCE_SECURE_WEBSOCKET) == "Y";
         let api_server = Config::get_option("api-server");
-        if api_server.starts_with("https") {
+        if force_secure || api_server.starts_with("https") {
             "wss"
         } else {
             "ws"
@@ -535,5 +636,33 @@ mod tests {
         assert_eq!(check_ws("127.0.0.1:23455"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:23456"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:34567"), "ws://127.0.0.1:34569");
+
+        // A branded build can require WSS independently of whether its API
+        // server is exposed through the user configuration.
+        Config::set_option(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
+            "hbbs.masterdesk.online".to_string(),
+        );
+        Config::set_option(
+            keys::OPTION_RELAY_SERVER.to_string(),
+            "hbbr.masterdesk.online".to_string(),
+        );
+        Config::set_option(keys::OPTION_API_SERVER.to_string(), String::new());
+        Config::set_option(
+            keys::OPTION_FORCE_SECURE_WEBSOCKET.to_string(),
+            "Y".to_string(),
+        );
+        assert_eq!(
+            check_ws("hbbs.masterdesk.online:21116"),
+            "wss://hbbs.masterdesk.online/ws/id"
+        );
+        assert_eq!(
+            check_ws("hbbr.masterdesk.online:21117"),
+            "wss://hbbr.masterdesk.online/ws/relay"
+        );
+        Config::set_option(
+            keys::OPTION_FORCE_SECURE_WEBSOCKET.to_string(),
+            String::new(),
+        );
     }
 }

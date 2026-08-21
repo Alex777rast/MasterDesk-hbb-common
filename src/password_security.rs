@@ -1,5 +1,7 @@
 use crate::config::Config;
 use sodiumoxide::{base64, crypto::secretbox};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -9,7 +11,6 @@ use std::{
 /// shared with a technician without changing after every completed session.
 /// Manual refreshes and brute-force protection may still rotate it earlier.
 pub const TEMPORARY_PASSWORD_ROTATION_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
-
 struct TemporaryPasswordState {
     value: String,
     generated_at: Instant,
@@ -40,6 +41,26 @@ impl TemporaryPasswordState {
 lazy_static::lazy_static! {
     static ref TEMPORARY_PASSWORD: Arc<RwLock<TemporaryPasswordState>> =
         Arc::new(RwLock::new(TemporaryPasswordState::new()));
+}
+
+#[cfg(target_os = "windows")]
+static TEMPORARY_PASSWORD_GUI_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Keeps temporary-password authentication enabled for exactly the lifetime of
+/// an authenticated main-GUI IPC connection. A polling delay must never change
+/// an incoming request from password authentication to click approval.
+#[cfg(target_os = "windows")]
+pub struct TemporaryPasswordGuiLease;
+
+#[cfg(target_os = "windows")]
+impl Drop for TemporaryPasswordGuiLease {
+    fn drop(&mut self) {
+        let _ = TEMPORARY_PASSWORD_GUI_CONNECTIONS.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |current| current.checked_sub(1),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +111,24 @@ pub fn temporary_password() -> String {
     state.value.clone()
 }
 
+#[cfg(target_os = "windows")]
+pub fn acquire_temporary_password_gui_lease() -> TemporaryPasswordGuiLease {
+    TEMPORARY_PASSWORD_GUI_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+    TemporaryPasswordGuiLease
+}
+
+#[inline]
+pub fn temporary_password_available_for_auth() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return TEMPORARY_PASSWORD_GUI_CONNECTIONS.load(Ordering::SeqCst) != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
 fn verification_method() -> VerificationMethod {
     let method = Config::get_option("verification-method");
     if method == "use-temporary-password" {
@@ -121,7 +160,9 @@ pub fn permanent_enabled() -> bool {
 }
 
 pub fn has_valid_password() -> bool {
-    temporary_enabled() && !temporary_password().is_empty()
+    temporary_enabled()
+        && temporary_password_available_for_auth()
+        && !temporary_password().is_empty()
         || permanent_enabled() && Config::has_permanent_password()
 }
 
@@ -466,6 +507,22 @@ mod test {
             generated_at,
             generated_at - Duration::from_secs(1)
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_temporary_password_gui_lease_follows_connection_lifetime() {
+        use super::*;
+
+        TEMPORARY_PASSWORD_GUI_CONNECTIONS.store(0, Ordering::SeqCst);
+        assert!(!temporary_password_available_for_auth());
+        let first = acquire_temporary_password_gui_lease();
+        assert!(temporary_password_available_for_auth());
+        let second = acquire_temporary_password_gui_lease();
+        drop(first);
+        assert!(temporary_password_available_for_auth());
+        drop(second);
+        assert!(!temporary_password_available_for_auth());
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub use sodiumoxide;
 pub use tokio_socks;
 pub use tokio_socks::IntoTargetAddr;
 pub use tokio_socks::TargetAddr;
+pub mod masterdesk_security;
 pub mod password_security;
 pub use chrono;
 pub use directories_next;

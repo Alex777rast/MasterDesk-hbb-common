@@ -104,6 +104,9 @@ message ChatMessage { string text = 1; }
 message Features {
   bool privacy_mode = 1;
   bool terminal = 2;
+  // The installed Windows service can prepare a one-shot Safe Mode with
+  // Networking boot and restore normal boot automatically.
+  bool safe_mode_reboot = 3;
 }
 
 message CodecAbility {
@@ -822,6 +825,13 @@ message MessageQuery {
   int32 switch_display = 1;
 }
 
+// The exact Windows keyboard layout (KLID) selected by the controlling computer.
+// After forwarding Alt+Shift/Ctrl+Shift, MasterDesk sends this target so the
+// controlled foreground window converges to the controller's resulting layout.
+message KeyboardLayout {
+  string klid = 1;
+}
+
 message Misc {
   oneof union {
     ChatMessage chat_message = 4;
@@ -859,6 +869,9 @@ message Misc {
     DisplayResolution change_display_resolution = 36;
     MessageQuery message_query = 37;
     int32 follow_current_display = 38;
+    KeyboardLayout keyboard_layout = 39;
+    bool restart_remote_device_safe_mode = 40;
+    string restart_remote_device_error = 41;
   }
 }
 
