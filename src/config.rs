@@ -216,6 +216,38 @@ pub enum NetworkType {
     ProxySocks,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PublicIdState {
+    None,
+    LocalUnverified,
+    ServerAssigned,
+    ServerConfirmed,
+    Rejected,
+}
+
+impl PublicIdState {
+    fn from_registration(
+        id_is_empty: bool,
+        allocation_pending: bool,
+        key_confirmed: bool,
+        registration_rejected: bool,
+    ) -> Self {
+        if id_is_empty {
+            Self::None
+        } else if allocation_pending {
+            if registration_rejected {
+                Self::Rejected
+            } else {
+                Self::LocalUnverified
+            }
+        } else if key_confirmed {
+            Self::ServerConfirmed
+        } else {
+            Self::ServerAssigned
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config {
     #[serde(
@@ -238,6 +270,8 @@ pub struct Config {
     keys_confirmed: HashMap<String, bool>,
     #[serde(default, deserialize_with = "deserialize_string")]
     installation_id: String,
+    #[serde(default, deserialize_with = "deserialize_bool")]
+    id_allocation_pending: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
@@ -715,6 +749,7 @@ impl Config {
             for _ in 0..3 {
                 if let Some(id) = Config::gen_id() {
                     config.id = id;
+                    config.id_allocation_pending = true;
                     store = true;
                     break;
                 } else {
@@ -1073,11 +1108,79 @@ impl Config {
 
     pub fn set_id(id: &str) {
         let mut config = CONFIG.write().unwrap();
-        if id == config.id {
+        if id == config.id && !config.id_allocation_pending {
             return;
         }
         config.id = id.into();
+        config.id_allocation_pending = false;
         config.store();
+    }
+
+    pub fn is_id_allocation_pending() -> bool {
+        CONFIG.read().unwrap().id_allocation_pending
+    }
+
+    pub fn get_public_id_state() -> PublicIdState {
+        let config = CONFIG.read().unwrap();
+        let id_is_empty = config.id.is_empty();
+        let allocation_pending = config.id_allocation_pending;
+        let key_confirmed = config.key_confirmed;
+        drop(config);
+
+        // A persisted server ID remains safe to display while the current
+        // process is reconnecting. key_confirmed describes this session's
+        // registration, not the provenance of the stored public ID.
+        PublicIdState::from_registration(
+            id_is_empty,
+            allocation_pending,
+            key_confirmed,
+            Self::get_option("registration-clock-error") == "Y",
+        )
+    }
+
+    pub fn get_public_id() -> String {
+        match Self::get_public_id_state() {
+            PublicIdState::ServerAssigned | PublicIdState::ServerConfirmed => {
+                CONFIG.read().unwrap().id.clone()
+            }
+            PublicIdState::None | PublicIdState::LocalUnverified | PublicIdState::Rejected => {
+                String::new()
+            }
+        }
+    }
+
+    pub fn accept_server_assigned_id(id: &str) -> bool {
+        let valid = id.len() == 9
+            && id.bytes().all(|value| value.is_ascii_digit())
+            && id
+                .parse::<u32>()
+                .map(|value| (100_000_000..=999_999_999).contains(&value))
+                .unwrap_or(false);
+        if !valid {
+            log::error!("Rejected invalid server-assigned ID: {id:?}");
+            return false;
+        }
+
+        let mut config = CONFIG.write().unwrap();
+        if !config.id_allocation_pending && config.id != id {
+            log::error!(
+                "Rejected unexpected server-assigned ID change from {} to {}",
+                config.id,
+                id
+            );
+            return false;
+        }
+        let previous = config.clone();
+        config.id = id.to_owned();
+        config.id_allocation_pending = false;
+        config.key_confirmed = false;
+        config.keys_confirmed.clear();
+        if let Err(err) = config.store_result() {
+            *config = previous;
+            log::error!("Failed to persist server-assigned ID: {err:#}");
+            return false;
+        }
+        true
     }
 
     /// Updates the effective ID for this process without pairing it with this
@@ -1309,7 +1412,10 @@ impl Config {
         if id.is_empty() {
             if let Some(tmp) = Config::gen_id() {
                 id = tmp;
-                Config::set_id(&id);
+                let mut config = CONFIG.write().unwrap();
+                config.id = id.clone();
+                config.id_allocation_pending = true;
+                config.store();
             }
         }
         id
@@ -1411,6 +1517,11 @@ impl Config {
             config.key_confirmed = false;
             config.keys_confirmed.clear();
             config.installation_id = installation_id;
+            // The signed command authorizes identity replacement, but the
+            // locally generated value is still only an allocation candidate.
+            // Keep it out of the public GUI and ask the MasterDesk server for
+            // the final ID on the next registration.
+            config.id_allocation_pending = true;
             config.store();
         }
         // Match Config::set(): release CONFIG before changing the key cache.
@@ -3138,6 +3249,7 @@ pub mod keys {
     pub const OPTION_DISABLE_AUDIO: &str = "disable_audio";
     pub const OPTION_ENABLE_REMOTE_PRINTER: &str = "enable-remote-printer";
     pub const OPTION_ENABLE_FILE_COPY_PASTE: &str = "enable-file-copy-paste";
+    pub const OPTION_PARALLEL_FILE_TRANSFER_MODE: &str = "parallel-file-transfer-mode";
     pub const OPTION_DISABLE_CLIPBOARD: &str = "disable_clipboard";
     pub const OPTION_LOCK_AFTER_SESSION_END: &str = "lock_after_session_end";
     pub const OPTION_PRIVACY_MODE: &str = "privacy_mode";
@@ -3678,6 +3790,7 @@ mod tests {
             key_confirmed: true,
             installation_id: "f749c5e0-75f2-4ba7-a4d7-a204be96ff2d".to_owned(),
             keys_confirmed: HashMap::from([("hbbs.masterdesk.online".to_owned(), true)]),
+            id_allocation_pending: false,
         };
         let path = std::env::temp_dir().join(format!(
             "masterdesk-config-serialization-{}.toml",
@@ -3685,6 +3798,96 @@ mod tests {
         ));
         let _file_guard = ConfigFileRestoreGuard::new(path.clone());
         store_path(path, cfg).unwrap();
+    }
+
+    #[test]
+    fn test_server_assigned_id_is_persisted_only_for_pending_allocation() {
+        let _state_lock = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file_(""));
+        let original_config = Config::get();
+        let _state_guard = ConfigStateTestGuard {
+            original_config,
+            original_hard_settings: HARD_SETTINGS.read().unwrap().clone(),
+        };
+        *CONFIG.write().unwrap() = Config {
+            id: "123456789".to_owned(),
+            id_allocation_pending: true,
+            ..Default::default()
+        };
+
+        assert!(Config::accept_server_assigned_id("987654321"));
+        assert_eq!(Config::get_id(), "987654321");
+        assert!(!Config::is_id_allocation_pending());
+        let stored = Config::load();
+        assert_eq!(stored.id, "987654321");
+        assert!(!stored.id_allocation_pending);
+    }
+
+    #[test]
+    fn test_server_assigned_id_cannot_replace_existing_upgrade_identity() {
+        with_config_and_hard_settings(
+            Config {
+                id: "123456789".to_owned(),
+                id_allocation_pending: false,
+                ..Default::default()
+            },
+            HashMap::new(),
+            || {
+                assert!(!Config::accept_server_assigned_id("987654321"));
+                assert_eq!(Config::get_id(), "123456789");
+            },
+        );
+    }
+
+    #[test]
+    fn test_public_id_state_separates_local_candidate_from_server_identity() {
+        assert_eq!(
+            PublicIdState::from_registration(true, false, false, false),
+            PublicIdState::None
+        );
+        assert_eq!(
+            PublicIdState::from_registration(false, true, false, false),
+            PublicIdState::LocalUnverified
+        );
+        assert_eq!(
+            PublicIdState::from_registration(false, true, false, true),
+            PublicIdState::Rejected
+        );
+        assert_eq!(
+            PublicIdState::from_registration(false, false, false, false),
+            PublicIdState::ServerAssigned
+        );
+        assert_eq!(
+            PublicIdState::from_registration(false, false, true, false),
+            PublicIdState::ServerConfirmed
+        );
+    }
+
+    #[test]
+    fn test_public_id_hides_unverified_local_candidate() {
+        with_config_and_hard_settings(
+            Config {
+                id: "123456789".to_owned(),
+                id_allocation_pending: true,
+                ..Default::default()
+            },
+            HashMap::new(),
+            || assert_eq!(Config::get_public_id(), ""),
+        );
+    }
+
+    #[test]
+    fn test_public_id_keeps_persisted_server_id_visible_while_reconnecting() {
+        with_config_and_hard_settings(
+            Config {
+                id: "123456789".to_owned(),
+                id_allocation_pending: false,
+                key_confirmed: false,
+                ..Default::default()
+            },
+            HashMap::new(),
+            || assert_eq!(Config::get_public_id(), "123456789"),
+        );
     }
 
     #[test]

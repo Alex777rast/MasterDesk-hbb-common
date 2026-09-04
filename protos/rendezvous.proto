@@ -119,6 +119,7 @@ message RegisterPk {
   string old_id = 4;
   bool no_register_device = 5;
   DeviceLease lease = 6;
+  bool request_id_allocation = 7;
 }
 
 message RegisterPkResponse {
@@ -131,9 +132,11 @@ message RegisterPkResponse {
     NOT_SUPPORT = 6;
     SERVER_ERROR = 7;
     NOT_DEPLOYED = 8;
+    CLOCK_MISMATCH = 9;
   }
   Result result = 1;
   int32 keep_alive = 2;
+  string assigned_id = 3;
 }
 
 message PunchHoleResponse {

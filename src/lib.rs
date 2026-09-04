@@ -444,6 +444,8 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
             // https://docs.rs/flexi_logger/latest/flexi_logger/error_info/index.html#write
             // though async logger more efficient, but it also causes more problems, disable it for now
             let mut path = config::Config::log_path();
+            #[cfg(target_os = "windows")]
+            migrate_legacy_masterdesk_log_names(&path);
             #[cfg(target_os = "android")]
             if !config::Config::get_home().exists() {
                 return;
@@ -456,7 +458,11 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 "debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
             ) {
                 logger_holder = x
-                    .log_to_file(FileSpec::default().directory(path))
+                    .log_to_file(
+                        FileSpec::default()
+                            .directory(path)
+                            .basename(config::APP_NAME.read().unwrap().to_lowercase()),
+                    )
                     .write_mode(if _is_async {
                         WriteMode::Async
                     } else {
@@ -474,6 +480,66 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         }
     });
     logger_holder
+}
+
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn migrate_legacy_masterdesk_log_names(root: &std::path::Path) {
+    if !config::APP_NAME
+        .read()
+        .unwrap()
+        .eq_ignore_ascii_case("MasterDesk")
+    {
+        return;
+    }
+
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !file_name.contains("rustdesk") {
+                continue;
+            }
+            let renamed = file_name.replace("rustdesk", "masterdesk");
+            let direct = path.with_file_name(&renamed);
+            let target = if !direct.exists() {
+                Some(direct)
+            } else {
+                let renamed = std::path::Path::new(&renamed);
+                let stem = renamed
+                    .file_stem()
+                    .map(|value| value.to_string_lossy())
+                    .unwrap_or_default();
+                let extension = renamed.extension().map(|value| value.to_string_lossy());
+                (1..=1000).find_map(|index| {
+                    let name = match &extension {
+                        Some(extension) => format!("{stem}_legacy_{index}.{extension}"),
+                        None => format!("{stem}_legacy_{index}"),
+                    };
+                    let candidate = path.with_file_name(name);
+                    (!candidate.exists()).then_some(candidate)
+                })
+            };
+            if let Some(target) = target {
+                let _ = std::fs::rename(path, target);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

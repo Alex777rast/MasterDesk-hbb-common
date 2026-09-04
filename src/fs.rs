@@ -559,6 +559,21 @@ fn join_validated_path(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
     Ok(TransferJob::join(base, name))
 }
 
+/// Resolve a remotely supplied relative entry below a local transfer base.
+/// Parallel receivers use the same traversal and symlink-component checks as
+/// the legacy sequential writer.
+pub fn resolve_transfer_path(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
+    join_validated_path(base, name)
+}
+
+pub fn set_transfer_file_modified_time(path: &Path, modified_time: u64) -> ResultType<()> {
+    filetime::set_file_mtime(
+        path,
+        filetime::FileTime::from_unix_time(modified_time as i64, 0),
+    )?;
+    Ok(())
+}
+
 impl TransferJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new_write(

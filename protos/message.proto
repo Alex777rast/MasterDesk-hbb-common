@@ -60,6 +60,14 @@ message PortForward {
 message FileTransfer {
   string dir = 1;
   bool show_hidden = 2;
+  // Non-empty only for an authenticated auxiliary transport belonging to a
+  // negotiated parallel file transfer.
+  string parallel_transfer_id = 3;
+  uint32 parallel_worker = 4;
+  bool parallel_auxiliary = 5;
+  // One-time bearer capability delivered only inside the already authorized
+  // primary session. It authenticates auxiliary transports and is never logged.
+  string parallel_auth_token = 6;
 }
 
 message ViewCamera {}
@@ -107,6 +115,12 @@ message Features {
   // The installed Windows service can prepare a one-shot Safe Mode with
   // Networking boot and restore normal boot automatically.
   bool safe_mode_reboot = 3;
+  // Supports one logical single-file transfer over several independently
+  // authenticated FILE_TRANSFER connections with absolute block offsets.
+  bool parallel_file_transfer_v1 = 4;
+  // Supports prefetching Windows Explorer virtual file clipboard contents into
+  // an immutable receiver-side cache through the parallel transfer pool.
+  bool parallel_clipboard_cache_v1 = 5;
 }
 
 message CodecAbility {
@@ -421,7 +435,11 @@ message FileAction {
   }
 }
 
-message FileTransferCancel { int32 id = 1; }
+message FileTransferCancel {
+  int32 id = 1;
+  string parallel_transfer_id = 2;
+  bool keep_partial = 3;
+}
 
 message FileResponse {
   oneof union {
@@ -443,6 +461,7 @@ message FileTransferDigest {
   bool is_identical = 6;
   uint64 transferred_size = 7; // For resume. Indicates the size of the file already transferred
   bool is_resume = 8;          // For resume. Indicates if the transfer is a resume.
+  string parallel_transfer_id = 9;
                                // `is_resume` can let the controlled side know whether to check the `.digest` file.
                                // When `is_resume` is false, `.digest` exists, the same file does not exist,
                                // the controlled side should not check `.digest`, it should confirm with a new transfer request.
@@ -454,12 +473,16 @@ message FileTransferBlock {
   bytes data = 3;
   bool compressed = 4;
   uint32 blk_id = 5;
+  uint64 offset = 6;
+  string parallel_transfer_id = 7;
+  uint32 parallel_worker = 8;
 }
 
 message FileTransferError {
   int32 id = 1;
   string error = 2;
   sint32 file_num = 3;
+  string parallel_transfer_id = 4;
 }
 
 message FileTransferSendRequest {
@@ -482,11 +505,18 @@ message FileTransferSendConfirmRequest {
     bool skip = 3;
     uint32 offset_blk = 4;
   }
+  string parallel_transfer_id = 5;
+  uint64 parallel_resume_offset = 6;
 }
 
 message FileTransferDone {
   int32 id = 1;
   sint32 file_num = 2;
+  string parallel_transfer_id = 3;
+  uint32 parallel_worker = 4;
+  bool worker_ack = 5;
+  bool finalize = 6;
+  bool transfer_complete = 7;
 }
 
 message FileTransferReceiveRequest {
@@ -495,6 +525,14 @@ message FileTransferReceiveRequest {
   repeated FileEntry files = 3;
   int32 file_num = 4;
   uint64 total_size = 5;
+  string parallel_transfer_id = 6;
+  uint64 range_start = 7;
+  uint64 range_len = 8;
+  uint32 parallel_worker = 9;
+  bool parallel_initialize = 10;
+  string parallel_auth_token = 11;
+  bool parallel_resume = 12;
+  bool parallel_clipboard_cache = 13;
 }
 
 message FileRemoveDir {
