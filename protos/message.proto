@@ -121,6 +121,8 @@ message Features {
   // Supports prefetching Windows Explorer virtual file clipboard contents into
   // an immutable receiver-side cache through the parallel transfer pool.
   bool parallel_clipboard_cache_v1 = 5;
+  // Supports symmetric ranged reads for parallel downloads in File Manager.
+  bool parallel_file_download_v1 = 6;
 }
 
 message CodecAbility {
@@ -496,6 +498,12 @@ message FileTransferSendRequest {
     Printer = 1;
   }
   FileType file_type = 5;
+  string parallel_transfer_id = 6;
+  uint64 range_start = 7;
+  uint64 range_len = 8;
+  uint32 parallel_worker = 9;
+  bool parallel_initialize = 10;
+  string parallel_auth_token = 11;
 }
 
 message FileTransferSendConfirmRequest {

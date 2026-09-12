@@ -414,6 +414,16 @@ pub struct TransferJob {
     default_overwrite_strategy: Option<bool>,
     #[serde(skip_serializing)]
     digest: FileDigest,
+    #[serde(skip_serializing)]
+    parallel_read_transfer_id: String,
+    #[serde(skip_serializing)]
+    parallel_read_worker: u32,
+    #[serde(skip_serializing)]
+    parallel_read_start: u64,
+    #[serde(skip_serializing)]
+    parallel_read_remaining: Option<u64>,
+    #[serde(skip_serializing)]
+    parallel_read_initialized: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -888,7 +898,33 @@ impl TransferJob {
                 }
             }
         }
+        if !self.parallel_read_initialized {
+            if self.parallel_read_remaining.is_some() {
+                if let Some(DataStream::FileStream(file)) = self.data_stream.as_mut() {
+                    file.seek(std::io::SeekFrom::Start(self.parallel_read_start))
+                        .await?;
+                }
+            }
+            self.parallel_read_initialized = true;
+        }
         Ok(false)
+    }
+
+    pub fn set_parallel_read_range(
+        &mut self,
+        transfer_id: String,
+        worker: u32,
+        start: u64,
+        len: u64,
+    ) {
+        self.parallel_read_transfer_id = transfer_id;
+        self.parallel_read_worker = worker;
+        self.parallel_read_start = start;
+        self.parallel_read_remaining = Some(len);
+        self.parallel_read_initialized = false;
+        self.enable_overwrite_detection = false;
+        self.file_confirmed = true;
+        self.file_is_waiting = false;
     }
 
     /// Get current file's digest (last_modified, file_size) for overwrite detection.
@@ -965,7 +1001,19 @@ impl TransferJob {
             DataSource::MemoryCursor(..) => "",
         };
         const BUF_SIZE: usize = 128 * 1024;
-        let mut buf: Vec<u8> = vec![0; BUF_SIZE];
+        let range_before = self.parallel_read_remaining;
+        let parallel_block_offset = self.parallel_read_start;
+        if matches!(range_before, Some(0)) {
+            self.file_num += 1;
+            self.data_stream = None;
+            self.file_confirmed = false;
+            self.file_is_waiting = false;
+            return Ok(None);
+        }
+        let wanted = range_before
+            .map(|remaining| remaining.min(BUF_SIZE as u64) as usize)
+            .unwrap_or(BUF_SIZE);
+        let mut buf: Vec<u8> = vec![0; wanted];
         let mut compressed = false;
         let mut offset: usize = 0;
         loop {
@@ -985,7 +1033,7 @@ impl TransferJob {
                 }
                 Ok(n) => {
                     offset += n;
-                    if n == 0 || offset == BUF_SIZE {
+                    if n == 0 || offset == wanted {
                         break;
                     }
                 }
@@ -993,6 +1041,9 @@ impl TransferJob {
         }
         unsafe { buf.set_len(offset) };
         if offset == 0 {
+            if range_before.map_or(false, |remaining| remaining > 0) {
+                bail!("unexpected end of file in parallel read range");
+            }
             if matches!(self.data_source, DataSource::MemoryCursor(_)) {
                 self.data_stream.take();
                 return Ok(None);
@@ -1002,8 +1053,15 @@ impl TransferJob {
             self.file_confirmed = false;
             self.file_is_waiting = false;
         } else {
+            if let Some(remaining) = self.parallel_read_remaining.as_mut() {
+                *remaining = remaining.saturating_sub(offset as u64);
+                self.parallel_read_start = self.parallel_read_start.saturating_add(offset as u64);
+            }
             self.finished_size += offset as u64;
-            if matches!(self.data_source, DataSource::FilePath(_)) && !is_compressed_file(name) {
+            if self.parallel_read_transfer_id.is_empty()
+                && matches!(self.data_source, DataSource::FilePath(_))
+                && !is_compressed_file(name)
+            {
                 let tmp = compress(&buf);
                 if tmp.len() < buf.len() {
                     buf = tmp;
@@ -1017,6 +1075,11 @@ impl TransferJob {
             file_num: file_num as _,
             data: buf.into(),
             compressed,
+            offset: range_before
+                .map(|_| parallel_block_offset)
+                .unwrap_or_default(),
+            parallel_transfer_id: self.parallel_read_transfer_id.clone(),
+            parallel_worker: self.parallel_read_worker,
             ..Default::default()
         }))
     }
@@ -1187,9 +1250,9 @@ impl TransferJob {
                 Some(file_transfer_send_confirm_request::Union::OffsetBlk(offset)) => {
                     self.set_file_confirmed(true);
                     // If offset is greater than 0, we need to seek to the offset
+                    let offset = requested_resume_offset(r, offset);
                     if offset > 0 {
-                        self.set_stream_offset(r.file_num as usize, offset as u64)
-                            .await;
+                        self.set_stream_offset(r.file_num as usize, offset).await;
                     }
                 }
                 _ => {}
@@ -1208,6 +1271,14 @@ impl TransferJob {
             show_hidden: self.show_hidden,
             is_remote: self.is_remote,
         }
+    }
+}
+
+fn requested_resume_offset(r: &FileTransferSendConfirmRequest, legacy_offset: u32) -> u64 {
+    if r.parallel_resume_offset > 0 {
+        r.parallel_resume_offset
+    } else {
+        legacy_offset as u64
     }
 }
 
@@ -1543,6 +1614,16 @@ pub fn serialize_transfer_job(job: &TransferJob, done: bool, cancel: bool, error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_confirmation_preserves_offsets_above_four_gibibytes() {
+        let expected = u32::MAX as u64 + 123_456;
+        let request = FileTransferSendConfirmRequest {
+            parallel_resume_offset: expected,
+            ..Default::default()
+        };
+        assert_eq!(requested_resume_offset(&request, u32::MAX), expected);
+    }
 
     struct TestTempDir {
         path: PathBuf,
