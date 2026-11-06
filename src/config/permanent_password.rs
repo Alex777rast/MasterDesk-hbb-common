@@ -3,11 +3,15 @@ use sodiumoxide::base64;
 
 use crate::{
     log,
-    password_security::{decrypt_str_or_original, symmetric_crypt},
+    password_security::{
+        decrypt_local_secret_str, decrypt_str_or_original, encrypt_local_secret_str,
+        symmetric_crypt, LOCAL_SECRET_ENC_VERSION,
+    },
 };
 
 pub(super) const PASSWORD_ENC_VERSION: &str = "00";
-pub(super) const PERMANENT_PASSWORD_ENC_VERSION: &str = "01";
+pub(super) const PERMANENT_PASSWORD_ENC_VERSION: &str = LOCAL_SECRET_ENC_VERSION;
+pub(super) const LEGACY_PERMANENT_PASSWORD_ENC_VERSION: &str = "01";
 pub(super) const PERMANENT_PASSWORD_HASH_PREFIX: &str = "00";
 const HBBS_PRESET_PASSWORD_HASH_PREFIX: &str = "00";
 pub(super) const PERMANENT_PASSWORD_H1_LEN: usize = 32;
@@ -72,28 +76,31 @@ fn decode_password_h1_after_prefix(
 }
 
 fn encrypt_permanent_password_storage(storage: &str) -> Option<String> {
-    if storage.chars().count() > ENCRYPT_MAX_LEN {
-        return None;
-    }
-    let encrypted = symmetric_crypt(storage.as_bytes(), true).ok()?;
-    Some(
-        PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(encrypted, base64::Variant::Original),
-    )
+    encrypt_local_secret_str(storage, ENCRYPT_MAX_LEN).ok()
 }
 
 pub(super) fn decrypt_permanent_password_str_or_original(storage: &str) -> (String, bool, bool) {
-    if storage.len() > VERSION_LEN && storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
+    if storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
+        return decrypt_local_secret_str(storage);
+    }
+    if storage.len() > VERSION_LEN && storage.starts_with(LEGACY_PERMANENT_PASSWORD_ENC_VERSION) {
         if let Ok(decoded) = base64::decode(
             &storage.as_bytes()[VERSION_LEN..],
             base64::Variant::Original,
         ) {
             if let Ok(v) = symmetric_crypt(&decoded, false) {
-                return (String::from_utf8_lossy(&v).to_string(), true, false);
+                return (String::from_utf8_lossy(&v).to_string(), true, true);
             }
         }
+        log::warn!("A legacy permanent-password verifier could not be decrypted; ignoring it");
+        return (String::new(), false, false);
     }
     (storage.to_owned(), false, !storage.is_empty())
+}
+
+pub(super) fn permanent_password_storage_is_versioned(storage: &str) -> bool {
+    storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION)
+        || storage.starts_with(LEGACY_PERMANENT_PASSWORD_ENC_VERSION)
 }
 
 pub fn local_permanent_password_storage_is_usable_for_auth(storage: &str, salt: &str) -> bool {
@@ -104,12 +111,9 @@ pub fn local_permanent_password_storage_is_usable_for_auth(storage: &str, salt: 
     if decode_permanent_password_h1_from_storage(storage).is_some() {
         return !salt.is_empty();
     }
-    if storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
-        let (_, decrypted, _) = decrypt_permanent_password_str_or_original(storage);
-        if decrypted {
-            log::error!("Permanent password storage looks current but cannot be decoded as a hash");
-            return false;
-        }
+    if permanent_password_storage_is_versioned(storage) {
+        log::error!("Permanent password storage is unavailable or cannot be decoded as a hash");
+        return false;
     }
 
     let (_, decrypted, looks_like_plaintext) =
@@ -177,7 +181,7 @@ pub(super) fn preset_permanent_password_storage_matches_plain(
 pub fn decode_permanent_password_h1_from_storage(
     storage: &str,
 ) -> Option<[u8; PERMANENT_PASSWORD_H1_LEN]> {
-    if storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
+    if permanent_password_storage_is_versioned(storage) {
         let (hashed_storage, decrypted, _) = decrypt_permanent_password_str_or_original(storage);
         if !decrypted {
             return None;
@@ -196,7 +200,7 @@ pub(super) fn password_is_empty_or_not_hashed(permanent_password_storage: &str) 
     if decode_permanent_password_h1_from_storage(permanent_password_storage).is_some() {
         return false;
     }
-    if permanent_password_storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
+    if permanent_password_storage_is_versioned(permanent_password_storage) {
         return false;
     }
     let (_, decrypted, looks_like_plaintext) =
@@ -208,6 +212,13 @@ pub(super) fn password_is_empty_or_not_hashed(permanent_password_storage: &str) 
 mod tests {
     use super::*;
     use crate::password_security::encrypt_str_or_original;
+
+    fn legacy_encrypted_permanent_password_storage(h1: &[u8; PERMANENT_PASSWORD_H1_LEN]) -> String {
+        let hashed_storage = encode_permanent_password_storage_from_h1(h1);
+        let encrypted = symmetric_crypt(hashed_storage.as_bytes(), true).unwrap();
+        LEGACY_PERMANENT_PASSWORD_ENC_VERSION.to_owned()
+            + &base64::encode(encrypted, base64::Variant::Original)
+    }
 
     fn encode_hbbs_preset_password_storage_from_h1(h1: &[u8; PERMANENT_PASSWORD_H1_LEN]) -> String {
         HBBS_PRESET_PASSWORD_HASH_PREFIX.to_owned() + &base64::encode(h1, base64::Variant::Original)
@@ -226,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn test_permanent_password_encrypted_storage_uses_01_outer_and_00_inner() {
+    fn test_permanent_password_encrypted_storage_uses_machine_bound_outer_and_00_inner() {
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let storage = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
 
@@ -237,6 +248,24 @@ mod tests {
         assert!(decrypted);
         assert!(!should_store);
         assert!(inner.starts_with(PERMANENT_PASSWORD_HASH_PREFIX));
+        assert_eq!(
+            decode_permanent_password_h1_from_storage(&storage),
+            Some(h1)
+        );
+    }
+
+    #[test]
+    fn test_legacy_permanent_password_storage_requests_machine_bound_migration() {
+        let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
+        let storage = legacy_encrypted_permanent_password_storage(&h1);
+
+        let (inner, decrypted, should_store) = decrypt_permanent_password_str_or_original(&storage);
+        assert!(decrypted);
+        assert!(should_store);
+        assert_eq!(
+            decode_permanent_password_h1_from_hashed_storage(&inner),
+            Some(h1)
+        );
         assert_eq!(
             decode_permanent_password_h1_from_storage(&storage),
             Some(h1)

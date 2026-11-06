@@ -23,6 +23,7 @@ use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
 mod permanent_password;
+mod profile_transfer;
 
 pub use permanent_password::{
     compute_permanent_password_h1, decode_permanent_password_h1_from_storage,
@@ -32,15 +33,21 @@ pub use permanent_password::{
 use permanent_password::{
     decode_permanent_password_h1_from_hashed_storage, decrypt_permanent_password_str_or_original,
     encode_permanent_password_encrypted_storage_from_h1, password_is_empty_or_not_hashed,
-    preset_permanent_password_storage_matches_plain, DEFAULT_SALT_LEN, PASSWORD_ENC_VERSION,
+    permanent_password_storage_is_versioned, preset_permanent_password_storage_matches_plain,
+    DEFAULT_SALT_LEN, PASSWORD_ENC_VERSION,
+};
+pub use profile_transfer::{
+    export_portable_profile, import_portable_profile, validate_profile_master_password,
+    ProfileTransferSummary,
 };
 
 use crate::{
     compress::{compress, decompress},
     log,
     password_security::{
-        decrypt_str_or_original, decrypt_vec_or_original, encrypt_str_or_original,
-        encrypt_vec_or_original, symmetric_crypt,
+        decrypt_local_secret_str, decrypt_local_secret_vec, decrypt_str_or_original,
+        encrypt_local_secret_str, encrypt_local_secret_vec, encrypt_str_or_original, is_encrypted,
+        is_local_secret_encrypted, symmetric_crypt,
     },
 };
 
@@ -66,6 +73,8 @@ lazy_static::lazy_static! {
 static PERMANENT_PASSWORD_MACHINE_MANAGED: AtomicBool = AtomicBool::new(false);
 static PERMANENT_PASSWORD_PRESERVE_PERSISTED_COPY: AtomicBool = AtomicBool::new(false);
 static MACHINE_PERMANENT_PASSWORD_H1: RwLock<Option<[u8; 32]>> = RwLock::new(None);
+const PRIMARY_KEY_PAIR_SECRET_PREFIX: &[u8] = b"MDKP1";
+const PRIMARY_KEY_PAIR_SECRET_MAX_LEN: usize = 4096;
 
 type Size = (i32, i32, i32, i32);
 type KeyPair = (Vec<u8>, Vec<u8>);
@@ -272,6 +281,11 @@ pub struct Config {
     installation_id: String,
     #[serde(default, deserialize_with = "deserialize_bool")]
     id_allocation_pending: bool,
+    /// Set only in memory when an existing primary configuration cannot be
+    /// parsed and no last-known-good copy can be recovered. While this flag is
+    /// set, identity generation and primary-config writes must fail closed.
+    #[serde(skip)]
+    identity_load_failed: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
@@ -546,16 +560,15 @@ impl Config2 {
         let mut config = Config::load_::<Config2>("2");
         let mut store = false;
         if let Some(mut socks) = config.socks {
-            let (password, _, store2) =
-                decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
+            let (password, _, store2) = decrypt_local_secret_str(&socks.password);
             socks.password = password;
             config.socks = Some(socks);
             store |= store2;
         }
-        let (unlock_pin, _, store2) =
-            decrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION);
+        let (unlock_pin, _, store2) = decrypt_local_secret_str(&config.unlock_pin);
         config.unlock_pin = unlock_pin;
         store |= store2;
+        store |= decrypt_sensitive_options(&mut config.options);
         if store {
             config.store();
         }
@@ -566,22 +579,62 @@ impl Config2 {
         Config::file_("2")
     }
 
+    /// Read in the source account before an installer crosses into LocalSystem.
+    /// Never silently replace an unreadable protected value with an empty one.
+    pub fn load_for_install_import(path: &Path) -> crate::ResultType<Self> {
+        let mut config: Self = confy::load_path(path)?;
+        if let Some(socks) = config.socks.as_mut() {
+            socks.password = decrypt_install_import_secret(&socks.password)?;
+        }
+        config.unlock_pin = decrypt_install_import_secret(&config.unlock_pin)?;
+        for (key, value) in config.options.iter_mut() {
+            if is_sensitive_option_key(key) {
+                *value = decrypt_install_import_secret(value)?;
+            }
+        }
+        Ok(config)
+    }
+
+    pub fn store_for_install_import(&self) -> crate::ResultType<()> {
+        // An explicit account transfer must not preserve destination ciphertext
+        // that was copied from another DPAPI account by an older installer.
+        self.store_with_existing(Self::file(), Config2::default())
+    }
+
     fn store(&self) {
+        if let Err(error) = self.store_result(Self::file()) {
+            log::error!("Failed to store Config2: {error:#}");
+        }
+    }
+
+    fn store_result(&self, path: PathBuf) -> crate::ResultType<()> {
+        let stored: Config2 = load_path(path.clone());
+        self.store_with_existing(path, stored)
+    }
+
+    fn store_with_existing(&self, path: PathBuf, stored: Config2) -> crate::ResultType<()> {
         let mut config = self.clone();
-        let stored = Config::load_::<Config2>("2");
         if let Some(mut socks) = config.socks {
             let stored_password = stored
                 .socks
                 .as_ref()
                 .map(|socks| socks.password.as_str())
                 .unwrap_or_default();
-            socks.password =
-                keep_encrypted_storage_if_plaintext_unchanged(&socks.password, stored_password);
+            socks.password = keep_local_secret_storage_if_plaintext_unchanged(
+                &socks.password,
+                stored_password,
+                ENCRYPT_MAX_LEN,
+            ).map_err(|_| anyhow!("Failed to protect proxy password; refusing Config2 write"))?;
             config.socks = Some(socks);
         }
-        config.unlock_pin =
-            keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
-        Config::store_(&config, "2");
+        config.unlock_pin = keep_local_secret_storage_if_plaintext_unchanged(
+            &config.unlock_pin,
+            &stored.unlock_pin,
+            ENCRYPT_MAX_LEN,
+        ).map_err(|_| anyhow!("Failed to protect unlock PIN; refusing Config2 write"))?;
+        protect_sensitive_options(&mut config.options, &stored.options)
+            .map_err(|_| anyhow!("Failed to protect sensitive options; refusing Config2 write"))?;
+        store_path(path, config)
     }
 
     pub fn get() -> Config2 {
@@ -599,12 +652,91 @@ impl Config2 {
     }
 }
 
+fn decrypt_install_import_secret(value: &str) -> crate::ResultType<String> {
+    let (plain, decrypted, _) = decrypt_local_secret_str(value);
+    if !decrypted && (is_encrypted(value.as_bytes()) || value.starts_with("02") || value.starts_with("03")) {
+        return Err(anyhow!("Cannot decrypt a protected installation setting in the source account"));
+    }
+    Ok(plain)
+}
+
 fn keep_encrypted_storage_if_plaintext_unchanged(plain: &str, stored: &str) -> String {
     let (stored_plain, encrypted, _) = decrypt_str_or_original(stored, PASSWORD_ENC_VERSION);
     if encrypted && stored_plain == plain {
         return stored.to_owned();
     }
     encrypt_str_or_original(plain, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
+}
+
+fn keep_local_secret_storage_if_plaintext_unchanged(
+    plain: &str,
+    stored: &str,
+    max_len: usize,
+) -> Result<String, ()> {
+    let (stored_plain, decrypted, should_migrate) = decrypt_local_secret_str(stored);
+    if decrypted && !should_migrate && stored_plain == plain {
+        return Ok(stored.to_owned());
+    }
+    // If a copied or temporarily unavailable DPAPI value could not be opened,
+    // preserve the ciphertext during unrelated settings writes. It remains
+    // unusable and is never exposed to callers.
+    if !decrypted && is_local_secret_encrypted(stored.as_bytes()) && plain.is_empty() {
+        return Ok(stored.to_owned());
+    }
+    encrypt_local_secret_str(plain, max_len)
+}
+
+fn is_sensitive_option_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "2fa"
+            | "bot"
+            | "access_token"
+            | "access-token"
+            | "default-connect-password"
+            | "preset-address-book-password"
+            | "proxy-password"
+            | "wayland-restore-token"
+    ) || key.ends_with("_token")
+        || key.ends_with("-token")
+        || key.ends_with("_secret")
+        || key.ends_with("-secret")
+        || key.ends_with("_credential")
+        || key.ends_with("-credential")
+}
+
+fn decrypt_sensitive_options(options: &mut HashMap<String, String>) -> bool {
+    let mut store = false;
+    for (key, value) in options.iter_mut() {
+        if !is_sensitive_option_key(key) {
+            continue;
+        }
+        let (plaintext, _, should_store) = decrypt_local_secret_str(value);
+        *value = plaintext;
+        store |= should_store;
+    }
+    store
+}
+
+fn protect_sensitive_options(
+    options: &mut HashMap<String, String>,
+    stored_options: &HashMap<String, String>,
+) -> Result<(), ()> {
+    for (key, value) in options.iter_mut() {
+        if !is_sensitive_option_key(key) {
+            continue;
+        }
+        *value = keep_local_secret_storage_if_plaintext_unchanged(
+            value,
+            stored_options
+                .get(key)
+                .map(String::as_str)
+                .unwrap_or_default(),
+            ENCRYPT_MAX_LEN,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
@@ -638,22 +770,7 @@ pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultTy
     }
     #[cfg(windows)]
     {
-        match confy::store_path(&path, &cfg) {
-            Ok(()) => Ok(()),
-            Err(confy::ConfyError::SerializeTomlError(err)) => {
-                // The pinned confy fork still serializes with toml 0.5. Some valid
-                // runtime configurations cannot be represented by that serializer,
-                // even though the current toml crate can read and write them. This
-                // used to make password changes appear successful while leaving the
-                // old file untouched. Keep the atomic temp-file replacement but use
-                // the current serializer only for that specific failure.
-                log::warn!(
-                    "Legacy TOML serializer rejected configuration; retrying with current serializer: {err}"
-                );
-                store_path_with_current_toml(path, &cfg)
-            }
-            Err(err) => Err(err.into()),
-        }
+        store_path_with_current_toml(path, &cfg)
     }
 }
 
@@ -662,16 +779,56 @@ fn store_path_with_current_toml<T: serde::Serialize>(
     path: PathBuf,
     cfg: &T,
 ) -> crate::ResultType<()> {
+    let serialized = toml::to_string_pretty(cfg)?;
+    store_serialized_toml_atomically(path, &serialized, |temporary| {
+        let serialized = fs::read_to_string(temporary)?;
+        let _: toml::Value = toml::from_str(&serialized)?;
+        Ok(())
+    })
+}
+
+#[cfg(windows)]
+fn store_primary_config_path(path: PathBuf, config: &Config) -> crate::ResultType<()> {
+    if config.identity_load_failed {
+        return Err(anyhow!(
+            "Refusing to overwrite an unrecoverable primary identity configuration"
+        ));
+    }
+    let serialized = toml::to_string_pretty(config)?;
+    let backup = primary_config_backup_path(&path);
+    let validate = |temporary: &Path| -> crate::ResultType<()> {
+        let stored: Config = confy::load_path(temporary)?;
+        if !stored_primary_identity_is_usable(&stored) {
+            return Err(anyhow!(
+                "Primary configuration read-back has no usable persistent identity"
+            ));
+        }
+        Ok(())
+    };
+
+    // Replace the recovery copy first. A power loss between these two atomic
+    // replacements therefore still leaves one complete, validated identity.
+    store_serialized_toml_atomically(backup, &serialized, validate)?;
+    store_serialized_toml_atomically(path, &serialized, validate)
+}
+
+#[cfg(windows)]
+fn store_serialized_toml_atomically(
+    path: PathBuf,
+    serialized: &str,
+    validate: impl Fn(&Path) -> crate::ResultType<()>,
+) -> crate::ResultType<()> {
     use std::{
         fs::OpenOptions,
+        os::windows::ffi::OsStrExt,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use winapi::um::winbase::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
 
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("Configuration path has no parent"))?;
     fs::create_dir_all(parent)?;
-    let serialized = toml::to_string_pretty(cfg)?;
     let mut temporary = path.clone();
     temporary.set_extension(format!(
         "{}.{}.tmp",
@@ -688,9 +845,33 @@ fn store_path_with_current_toml<T: serde::Serialize>(
             .create_new(true)
             .open(&temporary)?;
         file.write_all(serialized.as_bytes())?;
-        file.flush()?;
+        file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, &path)?;
+        validate(&temporary)?;
+        let source: Vec<u16> = temporary
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let destination: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let replaced = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            return Err(anyhow!(
+                "Failed to atomically replace configuration '{}': {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -699,7 +880,145 @@ fn store_path_with_current_toml<T: serde::Serialize>(
     result
 }
 
+fn primary_config_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".identity-backup");
+    PathBuf::from(backup)
+}
+
+fn confy_path_is_missing(error: &confy::ConfyError) -> bool {
+    matches!(
+        error,
+        confy::ConfyError::GeneralLoadError(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn stored_primary_identity_is_usable(config: &Config) -> bool {
+    is_encrypted(config.enc_id.as_bytes())
+        || (!config.id.is_empty()
+            && config.enc_id.is_empty()
+            && !is_encrypted(config.id.as_bytes()))
+}
+
+fn load_primary_config_path(path: &Path) -> (Config, bool) {
+    match confy::load_path::<Config>(path) {
+        Ok(config) => {
+            #[cfg(windows)]
+            if stored_primary_identity_is_usable(&config)
+                && !primary_config_backup_path(path).is_file()
+            {
+                if let Err(error) = store_primary_config_path(path.to_path_buf(), &config) {
+                    log::error!(
+                        "Failed to initialize the last-known-good primary identity copy: {error:#}"
+                    );
+                }
+            }
+            (config, false)
+        }
+        Err(error) if confy_path_is_missing(&error) => (Config::default(), false),
+        Err(error) => {
+            log::error!(
+                "Failed to load primary config '{}': {}. Trying the last-known-good identity copy",
+                path.display(),
+                error
+            );
+            let backup = primary_config_backup_path(path);
+            match confy::load_path::<Config>(&backup) {
+                Ok(config) if stored_primary_identity_is_usable(&config) => {
+                    #[cfg(windows)]
+                    if let Err(restore_error) =
+                        store_primary_config_path(path.to_path_buf(), &config)
+                    {
+                        log::error!(
+                            "Recovered identity from '{}', but failed to restore '{}': {:#}",
+                            backup.display(),
+                            path.display(),
+                            restore_error
+                        );
+                    }
+                    log::warn!(
+                        "Recovered primary identity configuration from '{}'",
+                        backup.display()
+                    );
+                    (config, false)
+                }
+                Ok(_) => {
+                    log::error!(
+                        "Last-known-good primary configuration '{}' has no usable identity; refusing identity replacement",
+                        backup.display()
+                    );
+                    let mut config = Config::default();
+                    config.identity_load_failed = true;
+                    (config, true)
+                }
+                Err(backup_error) => {
+                    log::error!(
+                        "Failed to recover primary configuration from '{}': {}; refusing identity replacement",
+                        backup.display(),
+                        backup_error
+                    );
+                    let mut config = Config::default();
+                    config.identity_load_failed = true;
+                    (config, true)
+                }
+            }
+        }
+    }
+}
+
 impl Config {
+    /// Installation is a same-machine, cross-account transfer, not a byte copy
+    /// of current-user DPAPI storage. Call while impersonating the source user;
+    /// return only an in-memory identity and re-protect after reverting.
+    pub fn load_for_install_import(path: &Path) -> crate::ResultType<(Self, Option<[u8; 32]>)> {
+        let mut config: Self = confy::load_path(path)?;
+        Self::unprotect_primary_key_pair(&mut config)?;
+        let secret = sign::SecretKey::from_slice(&config.key_pair.0)
+            .ok_or_else(|| anyhow!("Installation source has no valid signing key"))?;
+        if secret.public_key().as_ref() != config.key_pair.1.as_slice() {
+            return Err(anyhow!("Installation source signing key does not match its public identity"));
+        }
+        let (id, decrypted, _) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
+        if decrypted {
+            config.id = id;
+        } else if !config.enc_id.is_empty() || config.id.is_empty() {
+            return Err(anyhow!("Installation source ID is unavailable"));
+        }
+        Self::validate_or_decrypt_permanent_password_storage(&mut config)?;
+        let password_h1 = if config.password.is_empty() {
+            None
+        } else {
+            Some(decode_permanent_password_h1_from_storage(&config.password)
+                .ok_or_else(|| anyhow!("Installation source permanent password is unavailable"))?)
+        };
+        // The verifier crosses accounts in memory only. Its DPAPI ciphertext
+        // must be generated after leaving the source-user context, too.
+        config.password.clear();
+        Ok((config, password_h1))
+    }
+
+    pub fn store_for_install_import(&self, password_h1: Option<&[u8; 32]>) -> crate::ResultType<()> {
+        let mut config = self.clone();
+        if let Some(h1) = password_h1 {
+            config.password = encode_permanent_password_encrypted_storage_from_h1(h1)
+                .ok_or_else(|| anyhow!("Failed to protect imported permanent password"))?;
+        }
+        config.store_result()
+    }
+
+    /// Repair only the *same* identity copied by old installers into a DPAPI
+    /// context that cannot read it. Never replace another valid service ID.
+    pub fn can_repair_install_import_from(&self, source: &Self) -> bool {
+        let same_id = (!self.enc_id.is_empty() && self.enc_id == source.enc_id)
+            || (!self.id.is_empty() && self.id == source.id);
+        same_id
+            && !self.key_pair.1.is_empty()
+            && self.key_pair.1 == source.key_pair.1
+            && self.installation_id == source.installation_id
+            && Self::unprotect_primary_key_pair(&mut self.clone()).is_err()
+    }
+
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
         suffix: &str,
     ) -> T {
@@ -719,11 +1038,25 @@ impl Config {
     }
 
     fn load() -> Config {
-        let mut config = Config::load_::<Config>("");
-        let mut store = false;
-        if let Err(err) = Self::validate_or_decrypt_permanent_password_storage(&mut config) {
-            log::error!("Failed to validate or decrypt permanent password storage: {err}");
+        let (mut config, identity_load_failed) = load_primary_config_path(&Self::file_(""));
+        if identity_load_failed {
+            return config;
         }
+        let mut store = match Self::unprotect_primary_key_pair(&mut config) {
+            Ok(should_store) => should_store,
+            Err(err) => {
+                log::error!("Failed to load the machine-bound device identity: {err}");
+                config.identity_load_failed = true;
+                return config;
+            }
+        };
+        store |= match Self::validate_or_decrypt_permanent_password_storage(&mut config) {
+            Ok(should_store) => should_store,
+            Err(err) => {
+                log::error!("Failed to validate or decrypt permanent password storage: {err}");
+                false
+            }
+        };
         let mut id_valid = false;
         let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
         if encrypted {
@@ -744,6 +1077,13 @@ impl Config {
             id_valid = true;
             store = true;
         }
+        if !id_valid && is_encrypted(config.enc_id.as_bytes()) {
+            log::error!(
+                "Stored identity is present but cannot be decrypted; refusing to generate a replacement ID"
+            );
+            config.identity_load_failed = true;
+            return config;
+        }
         if !id_valid {
             log::warn!("ID is invalid, generating new one");
             for _ in 0..3 {
@@ -763,34 +1103,49 @@ impl Config {
         config
     }
 
-    fn validate_or_decrypt_permanent_password_storage(config: &mut Config) -> Result<()> {
+    fn validate_or_decrypt_permanent_password_storage(config: &mut Config) -> Result<bool> {
         if config.password.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         if config.password.starts_with(PASSWORD_ENC_VERSION) {
             let (plain, decrypted, should_store) =
                 decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
             if decrypted {
-                config.password = plain;
-                return Ok(());
+                Self::migrate_plain_permanent_password_storage(config, &plain)?;
+                return Ok(true);
             }
             if !should_store {
                 return Err(anyhow!("Invalid permanent password encrypted hash storage"));
             }
-            return Ok(());
         }
 
-        let (decrypted_storage, decrypted, _) =
+        let (decrypted_storage, decrypted, should_store) =
             decrypt_permanent_password_str_or_original(&config.password);
         if decrypted {
             Self::ensure_permanent_password_hash_salt(config)?;
-            if decode_permanent_password_h1_from_hashed_storage(&decrypted_storage).is_some() {
-                return Ok(());
+            let h1 = decode_permanent_password_h1_from_hashed_storage(&decrypted_storage)
+                .ok_or_else(|| anyhow!("Invalid permanent password encrypted hash storage"))?;
+            if should_store {
+                config.password = encode_permanent_password_encrypted_storage_from_h1(&h1)
+                    .ok_or_else(|| anyhow!("Failed to migrate permanent password storage"))?;
             }
+            return Ok(should_store);
+        }
+        if permanent_password_storage_is_versioned(&config.password) {
             return Err(anyhow!("Invalid permanent password encrypted hash storage"));
         }
 
+        let plain = config.password.clone();
+        Self::migrate_plain_permanent_password_storage(config, &plain)?;
+        Ok(true)
+    }
+
+    fn migrate_plain_permanent_password_storage(config: &mut Config, plain: &str) -> Result<()> {
+        Self::ensure_permanent_password_salt(config);
+        let h1 = compute_permanent_password_h1(plain, &config.salt);
+        config.password = encode_permanent_password_encrypted_storage_from_h1(&h1)
+            .ok_or_else(|| anyhow!("Failed to protect permanent password verifier"))?;
         Ok(())
     }
 
@@ -819,6 +1174,53 @@ impl Config {
         }
     }
 
+    fn unprotect_primary_key_pair(config: &mut Config) -> Result<bool> {
+        if config.key_pair.0.is_empty() {
+            return Ok(false);
+        }
+        if !config
+            .key_pair
+            .0
+            .starts_with(PRIMARY_KEY_PAIR_SECRET_PREFIX)
+        {
+            // Existing releases stored the signing key as raw bytes. Accept it
+            // once in memory and request immediate machine-bound migration.
+            return Ok(true);
+        }
+        let protected = &config.key_pair.0[PRIMARY_KEY_PAIR_SECRET_PREFIX.len()..];
+        let (secret, decrypted, should_migrate) = decrypt_local_secret_vec(protected);
+        if !decrypted || secret.is_empty() {
+            return Err(anyhow!(
+                "The device identity belongs to another Windows account or computer, or is damaged"
+            ));
+        }
+        config.key_pair.0 = secret;
+        Ok(should_migrate)
+    }
+
+    fn protect_primary_key_pair(config: &mut Config) -> Result<()> {
+        if config.key_pair.0.is_empty() {
+            return Ok(());
+        }
+        if config
+            .key_pair
+            .0
+            .starts_with(PRIMARY_KEY_PAIR_SECRET_PREFIX)
+        {
+            return Err(anyhow!("Refusing to double-protect the device identity"));
+        }
+        let protected =
+            encrypt_local_secret_vec(&config.key_pair.0, PRIMARY_KEY_PAIR_SECRET_MAX_LEN)
+                .map_err(|_| anyhow!("Failed to protect the device identity"))?;
+        config.key_pair.0.clear();
+        config
+            .key_pair
+            .0
+            .extend_from_slice(PRIMARY_KEY_PAIR_SECRET_PREFIX);
+        config.key_pair.0.extend_from_slice(&protected);
+        Ok(())
+    }
+
     fn store(&self) {
         if let Err(err) = self.store_result() {
             log::error!("Failed to store primary config: {err:#}");
@@ -826,8 +1228,14 @@ impl Config {
     }
 
     fn store_result(&self) -> crate::ResultType<()> {
+        if self.identity_load_failed {
+            return Err(anyhow!(
+                "Refusing to store primary config after an unrecoverable identity load failure"
+            ));
+        }
         let mut config = self.clone();
         Self::prepare_config_for_store(&mut config);
+        Self::protect_primary_key_pair(&mut config)?;
         if PERMANENT_PASSWORD_MACHINE_MANAGED.load(Ordering::SeqCst) {
             config.password.clear();
             config.salt.clear();
@@ -835,14 +1243,15 @@ impl Config {
             // Machine service synchronization failed. Authentication is disabled in
             // memory, but unrelated settings writes must preserve the recoverable legacy
             // pair on disk for a later successful service migration.
-            let stored = Config::load_::<Config>("");
+            let stored = load_primary_config_path(&Self::file_("")).0;
             config.password = stored.password;
             config.salt = stored.salt;
         }
         if !config.password.is_empty()
             && decode_permanent_password_h1_from_storage(&config.password).is_none()
+            && !permanent_password_storage_is_versioned(&config.password)
         {
-            let stored = Config::load_::<Config>("");
+            let stored = load_primary_config_path(&Self::file_("")).0;
             config.password =
                 keep_encrypted_storage_if_plaintext_unchanged(&config.password, &stored.password);
         }
@@ -853,7 +1262,14 @@ impl Config {
                 encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
         }
         config.id = "".to_owned();
-        store_path(Self::file_(""), config)
+        #[cfg(windows)]
+        {
+            store_primary_config_path(Self::file_(""), &config)
+        }
+        #[cfg(not(windows))]
+        {
+            store_path(Self::file_(""), config)
+        }
     }
 
     pub fn file() -> PathBuf {
@@ -1108,6 +1524,10 @@ impl Config {
 
     pub fn set_id(id: &str) {
         let mut config = CONFIG.write().unwrap();
+        if config.identity_load_failed {
+            log::error!("Refusing to replace ID after an unrecoverable primary-config load");
+            return;
+        }
         if id == config.id && !config.id_allocation_pending {
             return;
         }
@@ -1162,6 +1582,10 @@ impl Config {
         }
 
         let mut config = CONFIG.write().unwrap();
+        if config.identity_load_failed {
+            log::error!("Refusing server-assigned ID after an unrecoverable primary-config load");
+            return false;
+        }
         if !config.id_allocation_pending && config.id != id {
             log::error!(
                 "Rejected unexpected server-assigned ID change from {} to {}",
@@ -1291,6 +1715,12 @@ impl Config {
 
     pub fn get_installation_id() -> Vec<u8> {
         let mut config = CONFIG.write().unwrap();
+        if config.identity_load_failed {
+            log::error!(
+                "Installation ID is unavailable after an unrecoverable primary-config load"
+            );
+            return Vec::new();
+        }
         if config.installation_id.is_empty() {
             config.installation_id = uuid::Uuid::new_v4().to_string();
             config.store();
@@ -1330,7 +1760,15 @@ impl Config {
         if let Some(p) = lock.as_ref() {
             return p.clone();
         }
-        let mut config = Config::load_::<Config>("");
+        let (mut config, identity_load_failed) = load_primary_config_path(&Self::file_(""));
+        if identity_load_failed {
+            log::error!("Refusing to generate a key pair after primary-config recovery failed");
+            return KeyPair::default();
+        }
+        if let Err(error) = Self::unprotect_primary_key_pair(&mut config) {
+            log::error!("Existing key pair is unavailable: {error:#}");
+            return KeyPair::default();
+        }
         if config.key_pair.0.is_empty() {
             log::info!("Generated new keypair for id: {}", config.id);
             let (pk, sk) = sign::gen_keypair();
@@ -1362,7 +1800,15 @@ impl Config {
         // Config::load_ must remain a raw conf load/deserialize path and must never
         // call decrypt_* / symmetric_crypt (directly or indirectly), otherwise this
         // can re-enter key loading and deadlock.
-        let config = Config::load_::<Config>("");
+        let (mut config, identity_load_failed) = load_primary_config_path(&Self::file_(""));
+        if identity_load_failed {
+            log::error!("Existing key pair is unavailable after primary-config recovery failed");
+            return None;
+        }
+        if let Err(error) = Self::unprotect_primary_key_pair(&mut config) {
+            log::error!("Existing key pair is unavailable: {error:#}");
+            return None;
+        }
         if !config.key_pair.0.is_empty() {
             *lock = Some(config.key_pair.clone());
             Some(config.key_pair)
@@ -1408,7 +1854,13 @@ impl Config {
     }
 
     pub fn get_id() -> String {
-        let mut id = CONFIG.read().unwrap().id.clone();
+        let config = CONFIG.read().unwrap();
+        if config.identity_load_failed {
+            log::error!("ID is unavailable after an unrecoverable primary-config load");
+            return String::new();
+        }
+        let mut id = config.id.clone();
+        drop(config);
         if id.is_empty() {
             if let Some(tmp) = Config::gen_id() {
                 id = tmp;
@@ -1578,7 +2030,7 @@ impl Config {
         }
 
         // Do not ACK success until a fresh disk read sees the exact verifier pair.
-        let persisted = Config::load_::<Config>("");
+        let persisted = load_primary_config_path(&Self::file_("")).0;
         if persisted.password != config.password || persisted.salt != config.salt {
             config.password = previous_password;
             config.salt = previous_salt;
@@ -1932,7 +2384,7 @@ impl Config {
             return devices;
         }
         let devices = CONFIG2.read().unwrap().trusted_devices.clone();
-        let (devices, succ, store) = decrypt_str_or_original(&devices, PASSWORD_ENC_VERSION);
+        let (devices, succ, store) = decrypt_local_secret_str(&devices);
         if succ {
             let mut devices: Vec<TrustedDevice> =
                 serde_json::from_str(&devices).unwrap_or_default();
@@ -1956,7 +2408,13 @@ impl Config {
             log::error!("Trusted devices too large: {}", devices.bytes().len());
             return;
         }
-        let devices = encrypt_str_or_original(&devices, PASSWORD_ENC_VERSION, max_len);
+        let devices = match encrypt_local_secret_str(&devices, max_len) {
+            Ok(devices) => devices,
+            Err(()) => {
+                log::error!("Failed to protect trusted devices; refusing update");
+                return;
+            }
+        };
         let mut config = CONFIG2.write().unwrap();
         config.trusted_devices = devices;
         config.store();
@@ -1988,6 +2446,12 @@ impl Config {
     // This matches historical behavior, but may need revisiting in a separate PR.
     pub fn set(cfg: Config) -> bool {
         let mut lock = CONFIG.write().unwrap();
+        if lock.identity_load_failed {
+            log::error!(
+                "Refusing to replace primary config after an unrecoverable identity load failure"
+            );
+            return false;
+        }
         if *lock == cfg {
             return false;
         }
@@ -2035,24 +2499,32 @@ const PEER_ALIASES: &str = "peer_aliases";
 impl PeerConfig {
     pub fn load(id: &str) -> PeerConfig {
         let _lock = CONFIG.read().unwrap();
-        match confy::load_path(Self::path(id)) {
+        let path = Self::path(id);
+        match confy::load_path(&path) {
             Ok(config) => {
                 let mut config: PeerConfig = config;
                 let mut store = false;
-                let (password, _, store2) =
-                    decrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION);
+                let (password, _, store2) = decrypt_local_secret_vec(&config.password);
                 config.password = password;
                 store = store || store2;
                 for opt in ["rdp_password", "os-username", "os-password"] {
                     if let Some(v) = config.options.get_mut(opt) {
-                        let (encrypted, _, store2) =
-                            decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
-                        *v = encrypted;
+                        let (plaintext, _, store2) = decrypt_local_secret_str(v);
+                        *v = plaintext;
                         store = store || store2;
                     }
                 }
                 if store {
+                    let modified = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok();
                     config.store_(id);
+                    if let Some(modified) = modified {
+                        let _ = filetime::set_file_mtime(
+                            &path,
+                            filetime::FileTime::from_system_time(modified),
+                        );
+                    }
                 }
                 Self::apply_alias_override(id, &mut config);
                 config
@@ -2108,11 +2580,24 @@ impl PeerConfig {
 
     fn store_(&self, id: &str) {
         let mut config = self.clone();
-        config.password =
-            encrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        config.password = match encrypt_local_secret_vec(&config.password, ENCRYPT_MAX_LEN) {
+            Ok(password) => password,
+            Err(()) => {
+                log::error!("Failed to protect saved peer password; refusing peer config write");
+                return;
+            }
+        };
         for opt in ["rdp_password", "os-username", "os-password"] {
             if let Some(v) = config.options.get_mut(opt) {
-                *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
+                *v = match encrypt_local_secret_str(v, ENCRYPT_MAX_LEN) {
+                    Ok(value) => value,
+                    Err(()) => {
+                        log::error!(
+                            "Failed to protect saved peer credential; refusing peer config write"
+                        );
+                        return;
+                    }
+                }
             }
         }
         if let Err(err) = store_path(Self::path(id), config) {
@@ -2268,6 +2753,11 @@ impl PeerConfig {
     pub fn preload_peers() {
         std::thread::spawn(|| {
             Self::preload_peers_async();
+            for (id, _, _) in Self::get_vec_id_modified_time_path(&None) {
+                let _ = Self::load(&id);
+            }
+            let _ = Ab::load();
+            let _ = Group::load();
         });
     }
 
@@ -2530,11 +3020,21 @@ pub struct LocalConfig {
 
 impl LocalConfig {
     fn load() -> LocalConfig {
-        Config::load_::<LocalConfig>("_local")
+        let mut config = Config::load_::<LocalConfig>("_local");
+        if decrypt_sensitive_options(&mut config.options) {
+            config.store();
+        }
+        config
     }
 
     fn store(&self) {
-        Config::store_(self, "_local");
+        let mut config = self.clone();
+        let stored = Config::load_::<LocalConfig>("_local");
+        if protect_sensitive_options(&mut config.options, &stored.options).is_err() {
+            log::error!("Failed to protect local sensitive options; refusing local config write");
+            return;
+        }
+        Config::store_(&config, "_local");
     }
 
     pub fn get_kb_layout_type() -> String {
@@ -2739,12 +3239,24 @@ impl UserDefaultConfig {
     }
 
     pub fn load() -> UserDefaultConfig {
-        Config::load_::<UserDefaultConfig>("_default")
+        let mut config = Config::load_::<UserDefaultConfig>("_default");
+        if decrypt_sensitive_options(&mut config.options) {
+            config.store();
+        }
+        config
     }
 
     #[inline]
     fn store(&self) {
-        Config::store_(self, "_default");
+        let mut config = self.clone();
+        let stored = Config::load_::<UserDefaultConfig>("_default");
+        if protect_sensitive_options(&mut config.options, &stored.options).is_err() {
+            log::error!(
+                "Failed to protect sensitive default options; refusing default config write"
+            );
+            return;
+        }
+        Config::store_(&config, "_default");
     }
 
     pub fn get(&self, key: &str) -> String {
@@ -2910,6 +3422,86 @@ impl AbEntry {
     }
 }
 
+fn protect_local_profile_blob(data: &[u8]) -> Result<Vec<u8>> {
+    encrypt_local_secret_vec(data, 64 * 1024 * 1024)
+        .map_err(|_| anyhow!("Failed to protect local profile data"))
+}
+
+fn store_local_profile_blob_atomically(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Local profile path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = path.to_path_buf();
+    temporary.set_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        rand::thread_rng().gen::<u64>()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use winapi::um::winbase::{
+                MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            };
+            let source: Vec<u16> = temporary
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let destination: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            if unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } == 0
+            {
+                return Err(anyhow!(
+                    "Failed to atomically replace local profile data: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        #[cfg(not(windows))]
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn unprotect_local_profile_blob(data: &[u8]) -> Result<(Vec<u8>, bool)> {
+    let (plaintext, decrypted, should_migrate) = decrypt_local_secret_vec(data);
+    if decrypted {
+        return Ok((plaintext, should_migrate));
+    }
+    if is_local_secret_encrypted(data) {
+        return Err(anyhow!("Machine-bound local profile data is unavailable"));
+    }
+    // Address-book and group files historically stored raw symmetric
+    // ciphertext without a version/base64 wrapper.
+    symmetric_crypt(data, false)
+        .map(|plaintext| (plaintext, true))
+        .map_err(|_| anyhow!("Failed to decrypt legacy local profile data"))
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Ab {
     #[serde(
@@ -2929,33 +3521,43 @@ impl Ab {
     }
 
     pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
-                log::error!("ab data too large, {} > {}", data.len(), max_len);
+        let data = compress(json.as_bytes());
+        let max_len = 64 * 1024 * 1024;
+        if data.len() > max_len {
+            // maxlen of function decompress
+            log::error!("ab data too large, {} > {}", data.len(), max_len);
+            return;
+        }
+        let data = match protect_local_profile_blob(&data) {
+            Ok(data) => data,
+            Err(error) => {
+                log::error!("Failed to protect address book: {error:#}");
                 return;
             }
-            if let Ok(data) = symmetric_crypt(&data, true) {
-                file.write_all(&data).ok();
-            }
         };
+        if let Err(error) = store_local_profile_blob_atomically(&Self::path(), &data) {
+            log::error!("Failed to store address book: {error}");
+        }
     }
 
     pub fn load() -> Ab {
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
+                if let Ok((data, should_migrate)) = unprotect_local_profile_blob(&data) {
                     let data = decompress(&data);
                     if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data)) {
+                        if should_migrate {
+                            if let Ok(json) = serde_json::to_string(&ab) {
+                                Self::store(json);
+                            }
+                        }
                         return ab;
                     }
                 }
             }
         };
-        Self::remove();
+        log::warn!("Address book is unavailable; preserving its stored file");
         Ab::default()
     }
 
@@ -3059,33 +3661,43 @@ impl Group {
     }
 
     pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
+        let data = compress(json.as_bytes());
+        let max_len = 64 * 1024 * 1024;
+        if data.len() > max_len {
+            log::error!("group data too large, {} > {}", data.len(), max_len);
+            return;
+        }
+        let data = match protect_local_profile_blob(&data) {
+            Ok(data) => data,
+            Err(error) => {
+                log::error!("Failed to protect group data: {error:#}");
                 return;
             }
-            if let Ok(data) = symmetric_crypt(&data, true) {
-                file.write_all(&data).ok();
-            }
         };
+        if let Err(error) = store_local_profile_blob_atomically(&Self::path(), &data) {
+            log::error!("Failed to store group data: {error}");
+        }
     }
 
     pub fn load() -> Self {
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
+                if let Ok((data, should_migrate)) = unprotect_local_profile_blob(&data) {
                     let data = decompress(&data);
                     if let Ok(group) = serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
                     {
+                        if should_migrate {
+                            if let Ok(json) = serde_json::to_string(&group) {
+                                Self::store(json);
+                            }
+                        }
                         return group;
                     }
                 }
             }
         };
-        Self::remove();
+        log::warn!("Group data is unavailable; preserving its stored file");
         Self::default()
     }
 
@@ -3791,6 +4403,7 @@ mod tests {
             installation_id: "f749c5e0-75f2-4ba7-a4d7-a204be96ff2d".to_owned(),
             keys_confirmed: HashMap::from([("hbbs.masterdesk.online".to_owned(), true)]),
             id_allocation_pending: false,
+            identity_load_failed: false,
         };
         let path = std::env::temp_dir().join(format!(
             "masterdesk-config-serialization-{}.toml",
@@ -3798,6 +4411,156 @@ mod tests {
         ));
         let _file_guard = ConfigFileRestoreGuard::new(path.clone());
         store_path(path, cfg).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn primary_identity_test_config(id: &str) -> Config {
+        let (public_key, secret_key) = sign::gen_keypair();
+        Config {
+            id: String::new(),
+            enc_id: encrypt_str_or_original(id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN),
+            key_pair: (secret_key.0.to_vec(), public_key.0.to_vec()),
+            installation_id: uuid::Uuid::new_v4().to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn primary_identity_store_is_atomic_and_recovers_from_backup() {
+        let path = std::env::temp_dir().join(format!(
+            "masterdesk-primary-recovery-{}-{}.toml",
+            std::process::id(),
+            rand::thread_rng().gen::<u32>()
+        ));
+        let backup = primary_config_backup_path(&path);
+        let _path_guard = ConfigFileRestoreGuard::new(path.clone());
+        let _backup_guard = ConfigFileRestoreGuard::new(backup.clone());
+        let expected = primary_identity_test_config("123456789");
+
+        store_primary_config_path(path.clone(), &expected).unwrap();
+        let live: Config = confy::load_path(&path).unwrap();
+        let saved: Config = confy::load_path(&backup).unwrap();
+        assert_eq!(live.enc_id, expected.enc_id);
+        assert_eq!(saved.enc_id, expected.enc_id);
+
+        fs::write(&path, b"this is not valid toml = [").unwrap();
+        let (recovered, failed) = load_primary_config_path(&path);
+        assert!(!failed);
+        assert_eq!(recovered.enc_id, expected.enc_id);
+        let restored: Config = confy::load_path(&path).unwrap();
+        assert_eq!(restored.enc_id, expected.enc_id);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn primary_signing_key_is_machine_bound_and_tamper_evident() {
+        let original = vec![7u8; 64];
+        let mut config = Config {
+            key_pair: (original.clone(), vec![9u8; 32]),
+            ..Default::default()
+        };
+
+        Config::protect_primary_key_pair(&mut config).unwrap();
+        assert!(config
+            .key_pair
+            .0
+            .starts_with(PRIMARY_KEY_PAIR_SECRET_PREFIX));
+        assert_ne!(config.key_pair.0, original);
+
+        let mut restored = config.clone();
+        assert!(!Config::unprotect_primary_key_pair(&mut restored).unwrap());
+        assert_eq!(restored.key_pair.0, original);
+
+        let last = config.key_pair.0.last_mut().unwrap();
+        *last = if *last == b'A' { b'B' } else { b'A' };
+        assert!(Config::unprotect_primary_key_pair(&mut config).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_import_unprotects_identity_without_changing_source_or_id() {
+        let path = std::env::temp_dir().join(format!("masterdesk-install-import-{}.toml", uuid::Uuid::new_v4()));
+        let _guard = ConfigFileRestoreGuard::new(path.clone());
+        let (public, secret) = sign::gen_keypair();
+        let mut source = Config {
+            id: "123456789".into(),
+            key_pair: (secret.as_ref().to_vec(), public.as_ref().to_vec()),
+            installation_id: uuid::Uuid::new_v4().to_string(),
+            salt: "synthetic-install-import-salt".into(),
+            password: encode_permanent_password_encrypted_storage_from_h1(&[1u8; 32]).unwrap(),
+            ..Default::default()
+        };
+        Config::protect_primary_key_pair(&mut source).unwrap();
+        store_path(path.clone(), &source).unwrap();
+        let stored_bytes = fs::read(&path).unwrap();
+        let (imported, password_h1) = Config::load_for_install_import(&path).unwrap();
+        assert_eq!(password_h1, Some([1u8; 32]));
+        assert!(imported.password.is_empty());
+        assert_eq!(imported.id, source.id);
+        assert_eq!(imported.installation_id, source.installation_id);
+        assert!(imported.key_pair.0 == secret.as_ref());
+        assert_eq!(imported.key_pair.1, source.key_pair.1);
+        assert_eq!(fs::read(&path).unwrap(), stored_bytes);
+        assert!(!source.can_repair_install_import_from(&imported));
+
+        // Emulate a copy that is unreadable in the destination DPAPI context.
+        let mut unreadable = source.clone();
+        unreadable.key_pair.0 = b"MDKP103not-readable".to_vec();
+        assert!(unreadable.can_repair_install_import_from(&imported));
+        unreadable.installation_id = uuid::Uuid::new_v4().to_string();
+        assert!(!unreadable.can_repair_install_import_from(&imported));
+        unreadable.installation_id = imported.installation_id.clone();
+        unreadable.key_pair.1[0] ^= 1;
+        assert!(!unreadable.can_repair_install_import_from(&imported));
+        store_path(path.clone(), unreadable).unwrap();
+        assert!(Config::load_for_install_import(&path).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_import_reprotects_sensitive_options_and_rejects_unreadable_values() {
+        let path = std::env::temp_dir().join(format!("masterdesk-install-import-options-{}.toml", uuid::Uuid::new_v4()));
+        let _guard = ConfigFileRestoreGuard::new(path.clone());
+        let mut source = Config2::default();
+        source.unlock_pin = "import-test-pin".into();
+        source.options.insert("custom-rendezvous-server".into(), "example.test".into());
+        source.options.insert("access_token".into(), "synthetic-import-fixture".into());
+        source.store_result(path.clone()).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-import-fixture"));
+        assert_eq!(Config2::load_for_install_import(&path).unwrap(), source);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let mut damaged: Config2 = confy::load_path(&path).unwrap();
+        damaged.options.insert("access_token".into(), "03not-readable".into());
+        store_path(path.clone(), damaged).unwrap();
+        assert!(Config2::load_for_install_import(&path).is_err());
+        source.options.insert("access_token".into(), String::new());
+        source.store_with_existing(path.clone(), Config2::default()).unwrap();
+        assert_eq!(Config2::load_for_install_import(&path).unwrap(), source);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unrecoverable_primary_identity_fails_closed_without_generating_id() {
+        let path = std::env::temp_dir().join(format!(
+            "masterdesk-primary-fail-closed-{}-{}.toml",
+            std::process::id(),
+            rand::thread_rng().gen::<u32>()
+        ));
+        let backup = primary_config_backup_path(&path);
+        let _path_guard = ConfigFileRestoreGuard::new(path.clone());
+        let _backup_guard = ConfigFileRestoreGuard::new(backup.clone());
+        fs::write(&path, b"invalid = [").unwrap();
+        fs::write(&backup, b"also invalid = [").unwrap();
+
+        let (failed_config, failed) = load_primary_config_path(&path);
+        assert!(failed);
+        assert!(failed_config.identity_load_failed);
+        with_config_and_hard_settings(failed_config.clone(), HashMap::new(), || {
+            assert_eq!(Config::get_id(), "");
+            assert!(failed_config.store_result().is_err());
+        });
     }
 
     #[test]
@@ -4047,25 +4810,31 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_or_decrypt_keeps_plaintext_permanent_password_unchanged() {
+    fn test_validate_or_decrypt_migrates_plaintext_permanent_password() {
         let mut cfg = Config::default();
         cfg.password = "p@ssw0rd".to_owned();
         cfg.salt = "".to_owned();
-        Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap();
-        assert_eq!(cfg.password, "p@ssw0rd");
-        assert!(cfg.salt.is_empty());
+        assert!(Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap());
+        assert!(!cfg.salt.is_empty());
+        assert_eq!(
+            decode_permanent_password_h1_from_storage(&cfg.password),
+            Some(compute_permanent_password_h1("p@ssw0rd", &cfg.salt))
+        );
     }
 
     #[test]
-    fn test_validate_or_decrypt_decrypts_00_permanent_password_without_forcing_store() {
+    fn test_validate_or_decrypt_migrates_00_permanent_password() {
         let mut cfg = Config::default();
         let legacy_storage =
             encrypt_str_or_original("legacy-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
         cfg.password = legacy_storage;
         cfg.salt = "".to_owned();
-        Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap();
-        assert_eq!(cfg.password, "legacy-secret");
-        assert!(cfg.salt.is_empty());
+        assert!(Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap());
+        assert!(!cfg.salt.is_empty());
+        assert_eq!(
+            decode_permanent_password_h1_from_storage(&cfg.password),
+            Some(compute_permanent_password_h1("legacy-secret", &cfg.salt))
+        );
     }
 
     #[test]
@@ -4225,14 +4994,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_or_decrypt_keeps_plaintext_permanent_password_with_current_prefix_and_long_base64(
-    ) {
+    fn test_validate_or_decrypt_rejects_plaintext_shaped_like_current_storage() {
         let mut cfg = Config::default();
-        let plain = "01".to_owned() + &base64::encode([42u8; 24], base64::Variant::Original);
+        let plain = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
+            + &base64::encode([42u8; 24], base64::Variant::Original);
         cfg.password = plain.clone();
         cfg.salt = "".to_owned();
 
-        Config::validate_or_decrypt_permanent_password_storage(&mut cfg).unwrap();
+        assert!(Config::validate_or_decrypt_permanent_password_storage(&mut cfg).is_err());
         assert_eq!(cfg.password, plain);
         assert!(cfg.salt.is_empty());
     }

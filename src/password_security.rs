@@ -185,6 +185,11 @@ pub fn hide_cm() -> bool {
 
 const VERSION_LEN: usize = 2;
 const FORMAT_V1: u8 = 1;
+pub const LOCAL_SECRET_ENC_VERSION: &str = "03";
+const LEGACY_LOCAL_SECRET_ENC_VERSION: &str = "02";
+const LOCAL_SECRET_MIN_ENCODED_BYTES: usize = 16;
+const LOCAL_SECRET_ENTROPY_CONTEXT: &[u8] = b"MasterDesk local profile secrets v2";
+const LEGACY_LOCAL_SECRET_ENTROPY_CONTEXT: &[u8] = b"MasterDesk local profile secrets v1";
 
 // Check if data is already encrypted by verifying:
 // 1) version prefix "00"
@@ -196,7 +201,7 @@ const FORMAT_V1: u8 = 1;
 // The decoded payload may be either legacy ciphertext or FORMAT_V1 || nonce || ciphertext.
 // Reference: secretbox::seal returns ciphertext length = plaintext length + MACBYTES
 // https://github.com/sodiumoxide/sodiumoxide/blob/3057acb1a030ad86ed8892a223d64036ab5e8523/src/crypto/secretbox/xsalsa20poly1305.rs#L67
-fn is_encrypted(v: &[u8]) -> bool {
+pub(crate) fn is_encrypted(v: &[u8]) -> bool {
     if v.len() <= VERSION_LEN || !v.starts_with(b"00") {
         return false;
     }
@@ -204,6 +209,326 @@ fn is_encrypted(v: &[u8]) -> bool {
         Ok(decoded) => decoded.len() >= sodiumoxide::crypto::secretbox::MACBYTES,
         Err(_) => false,
     }
+}
+
+pub(crate) fn is_local_secret_encrypted(v: &[u8]) -> bool {
+    if v.len() <= VERSION_LEN
+        || !(v.starts_with(LOCAL_SECRET_ENC_VERSION.as_bytes())
+            || v.starts_with(LEGACY_LOCAL_SECRET_ENC_VERSION.as_bytes()))
+    {
+        return false;
+    }
+    match base64::decode(&v[VERSION_LEN..], base64::Variant::Original) {
+        Ok(decoded) => decoded.len() >= LOCAL_SECRET_MIN_ENCODED_BYTES,
+        Err(_) => false,
+    }
+}
+
+/// Encrypts a user-profile secret with an OS-backed, machine-bound key.
+///
+/// On Windows this uses current-user DPAPI plus entropy derived from the
+/// machine UID and the SMBIOS system UUID. The hardware UUID keeps independently
+/// running cloned Windows installations isolated even when their copied
+/// MachineGuid and user DPAPI material are identical. Failure is closed:
+/// plaintext is never returned as a storage value.
+pub fn encrypt_local_secret_str(s: &str, max_len: usize) -> Result<String, ()> {
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    if s.chars().count() > max_len {
+        return Err(());
+    }
+    let encrypted = local_secret_crypt(s.as_bytes(), true)?;
+    Ok(LOCAL_SECRET_ENC_VERSION.to_owned() + &base64::encode(encrypted, base64::Variant::Original))
+}
+
+/// Returns `(plaintext, decrypted, should_migrate)`.
+///
+/// Current machine-bound ciphertext that cannot be opened is returned as an
+/// empty value and is never treated as plaintext. Legacy `00` values and
+/// plaintext values request migration when they can be read safely.
+pub fn decrypt_local_secret_str(s: &str) -> (String, bool, bool) {
+    if s.is_empty() {
+        return (String::new(), false, false);
+    }
+    if s.starts_with(LOCAL_SECRET_ENC_VERSION) {
+        if let Ok(decoded) = base64::decode(&s.as_bytes()[VERSION_LEN..], base64::Variant::Original)
+        {
+            if let Ok(decrypted) = local_secret_crypt(&decoded, false) {
+                if let Ok(plaintext) = String::from_utf8(decrypted) {
+                    return (plaintext, true, false);
+                }
+            }
+        }
+        log::warn!("A machine-bound local secret could not be decrypted; ignoring it");
+        return (String::new(), false, false);
+    }
+    if s.starts_with(LEGACY_LOCAL_SECRET_ENC_VERSION) {
+        if let Ok(decoded) = base64::decode(&s.as_bytes()[VERSION_LEN..], base64::Variant::Original)
+        {
+            if let Ok(decrypted) = legacy_local_secret_crypt(&decoded, false) {
+                if let Ok(plaintext) = String::from_utf8(decrypted) {
+                    return (plaintext, true, true);
+                }
+            }
+        }
+        log::warn!("A legacy machine-bound local secret could not be decrypted; ignoring it");
+        return (String::new(), false, false);
+    }
+    if is_encrypted(s.as_bytes()) {
+        let (plaintext, decrypted, _) = decrypt_str_or_original(s, "00");
+        if decrypted {
+            return (plaintext, true, true);
+        }
+        log::warn!("A legacy local secret could not be decrypted; ignoring it");
+        return (String::new(), false, false);
+    }
+    (s.to_owned(), false, true)
+}
+
+pub fn encrypt_local_secret_vec(v: &[u8], max_len: usize) -> Result<Vec<u8>, ()> {
+    if v.is_empty() {
+        return Ok(Vec::new());
+    }
+    if v.len() > max_len {
+        return Err(());
+    }
+    let encrypted = local_secret_crypt(v, true)?;
+    let mut output = LOCAL_SECRET_ENC_VERSION.as_bytes().to_vec();
+    output.extend(base64::encode(encrypted, base64::Variant::Original).into_bytes());
+    Ok(output)
+}
+
+pub fn decrypt_local_secret_vec(v: &[u8]) -> (Vec<u8>, bool, bool) {
+    if v.is_empty() {
+        return (Vec::new(), false, false);
+    }
+    if v.starts_with(LOCAL_SECRET_ENC_VERSION.as_bytes()) {
+        if let Ok(decoded) = base64::decode(&v[VERSION_LEN..], base64::Variant::Original) {
+            if let Ok(decrypted) = local_secret_crypt(&decoded, false) {
+                return (decrypted, true, false);
+            }
+        }
+        log::warn!("A machine-bound local secret could not be decrypted; ignoring it");
+        return (Vec::new(), false, false);
+    }
+    if v.starts_with(LEGACY_LOCAL_SECRET_ENC_VERSION.as_bytes()) {
+        if let Ok(decoded) = base64::decode(&v[VERSION_LEN..], base64::Variant::Original) {
+            if let Ok(decrypted) = legacy_local_secret_crypt(&decoded, false) {
+                return (decrypted, true, true);
+            }
+        }
+        log::warn!("Legacy machine-bound local secret data could not be decrypted; ignoring it");
+        return (Vec::new(), false, false);
+    }
+    if is_encrypted(v) {
+        let (plaintext, decrypted, _) = decrypt_vec_or_original(v, "00");
+        if decrypted {
+            return (plaintext, true, true);
+        }
+        log::warn!("A legacy local secret could not be decrypted; ignoring it");
+        return (Vec::new(), false, false);
+    }
+    (v.to_owned(), false, true)
+}
+
+#[cfg(target_os = "windows")]
+fn local_secret_entropy() -> Result<Vec<u8>, ()> {
+    use sha2::{Digest, Sha256};
+
+    let machine_uid = machine_uid::get().map_err(|error| {
+        log::error!("Failed to obtain machine UID for local secret protection: {error}");
+    })?;
+    if machine_uid.is_empty() {
+        log::error!("Machine UID for local secret protection is empty");
+        return Err(());
+    }
+    let smbios_uuid = windows_smbios_system_uuid()?;
+    let mut digest = Sha256::new();
+    digest.update(LOCAL_SECRET_ENTROPY_CONTEXT);
+    digest.update(machine_uid.as_bytes());
+    digest.update(smbios_uuid);
+    Ok(digest.finalize().to_vec())
+}
+
+#[cfg(target_os = "windows")]
+fn legacy_local_secret_entropy() -> Result<Vec<u8>, ()> {
+    use sha2::{Digest, Sha256};
+
+    let machine_uid = machine_uid::get().map_err(|error| {
+        log::error!("Failed to obtain machine UID for legacy local secret migration: {error}");
+    })?;
+    if machine_uid.is_empty() {
+        return Err(());
+    }
+    let mut digest = Sha256::new();
+    digest.update(LEGACY_LOCAL_SECRET_ENTROPY_CONTEXT);
+    digest.update(machine_uid.as_bytes());
+    Ok(digest.finalize().to_vec())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_smbios_system_uuid() -> Result<[u8; 16], ()> {
+    use std::ptr;
+    use winapi::um::sysinfoapi::GetSystemFirmwareTable;
+
+    const RAW_SMBIOS_PROVIDER: u32 = u32::from_be_bytes(*b"RSMB");
+    let size = unsafe { GetSystemFirmwareTable(RAW_SMBIOS_PROVIDER, 0, ptr::null_mut(), 0) };
+    if size < 8 {
+        log::error!("SMBIOS data is unavailable for local secret protection");
+        return Err(());
+    }
+    let mut raw = vec![0u8; size as usize];
+    let written =
+        unsafe { GetSystemFirmwareTable(RAW_SMBIOS_PROVIDER, 0, raw.as_mut_ptr() as *mut _, size) };
+    if written != size {
+        log::error!("SMBIOS data changed while reading local secret protection identity");
+        return Err(());
+    }
+    parse_raw_smbios_system_uuid(&raw).ok_or_else(|| {
+        log::error!("A valid SMBIOS system UUID is unavailable for local secret protection");
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn parse_raw_smbios_system_uuid(raw: &[u8]) -> Option<[u8; 16]> {
+    const RAW_HEADER_LEN: usize = 8;
+    const STRUCTURE_HEADER_LEN: usize = 4;
+    if raw.len() < RAW_HEADER_LEN {
+        return None;
+    }
+    let table_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+    let end = RAW_HEADER_LEN.checked_add(table_len)?;
+    if end > raw.len() {
+        return None;
+    }
+    let mut position = RAW_HEADER_LEN;
+    while position.checked_add(STRUCTURE_HEADER_LEN)? <= end {
+        let structure_type = raw[position];
+        let structure_len = raw[position + 1] as usize;
+        if structure_len < STRUCTURE_HEADER_LEN || position.checked_add(structure_len)? > end {
+            return None;
+        }
+        if structure_type == 1 && structure_len >= 24 {
+            let uuid_slice = raw.get(position + 8..position + 24)?;
+            if uuid_slice.iter().any(|byte| *byte != 0)
+                && uuid_slice.iter().any(|byte| *byte != 0xff)
+            {
+                let mut uuid = [0u8; 16];
+                uuid.copy_from_slice(uuid_slice);
+                return Some(uuid);
+            }
+        }
+        if structure_type == 127 {
+            return None;
+        }
+        let mut next = position.checked_add(structure_len)?;
+        let mut terminator_found = false;
+        while next.checked_add(1)? < end {
+            if raw[next] == 0 && raw[next + 1] == 0 {
+                next += 2;
+                terminator_found = true;
+                break;
+            }
+            next += 1;
+        }
+        if !terminator_found {
+            return None;
+        }
+        position = next;
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn local_secret_crypt(data: &[u8], encrypt: bool) -> Result<Vec<u8>, ()> {
+    let entropy = local_secret_entropy()?;
+    local_secret_crypt_with_entropy(data, &entropy, encrypt)
+}
+
+#[cfg(target_os = "windows")]
+fn legacy_local_secret_crypt(data: &[u8], encrypt: bool) -> Result<Vec<u8>, ()> {
+    let entropy = legacy_local_secret_entropy()?;
+    local_secret_crypt_with_entropy(data, &entropy, encrypt)
+}
+
+#[cfg(target_os = "windows")]
+fn local_secret_crypt_with_entropy(
+    data: &[u8],
+    entropy: &[u8],
+    encrypt: bool,
+) -> Result<Vec<u8>, ()> {
+    use std::{convert::TryFrom, ptr};
+    use winapi::um::{
+        dpapi::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN},
+        winbase::LocalFree,
+        wincrypt::DATA_BLOB,
+    };
+
+    let mut input = data.to_vec();
+    let mut entropy = entropy.to_vec();
+    let mut input_blob = DATA_BLOB {
+        cbData: u32::try_from(input.len()).map_err(|_| ())?,
+        pbData: input.as_mut_ptr(),
+    };
+    let mut entropy_blob = DATA_BLOB {
+        cbData: u32::try_from(entropy.len()).map_err(|_| ())?,
+        pbData: entropy.as_mut_ptr(),
+    };
+    let mut output_blob = DATA_BLOB {
+        cbData: 0,
+        pbData: ptr::null_mut(),
+    };
+    let success = unsafe {
+        if encrypt {
+            CryptProtectData(
+                &mut input_blob,
+                ptr::null(),
+                &mut entropy_blob,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output_blob,
+            )
+        } else {
+            CryptUnprotectData(
+                &mut input_blob,
+                ptr::null_mut(),
+                &mut entropy_blob,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output_blob,
+            )
+        }
+    };
+    input.fill(0);
+    entropy.fill(0);
+    if success == 0 || output_blob.pbData.is_null() {
+        if !output_blob.pbData.is_null() {
+            unsafe {
+                LocalFree(output_blob.pbData as _);
+            }
+        }
+        return Err(());
+    }
+    let output = unsafe {
+        let value =
+            std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec();
+        LocalFree(output_blob.pbData as _);
+        value
+    };
+    Ok(output)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_secret_crypt(data: &[u8], encrypt: bool) -> Result<Vec<u8>, ()> {
+    symmetric_crypt(data, encrypt)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn legacy_local_secret_crypt(data: &[u8], encrypt: bool) -> Result<Vec<u8>, ()> {
+    symmetric_crypt(data, encrypt)
 }
 
 pub fn encrypt_str_or_original(s: &str, version: &str, max_len: usize) -> String {
@@ -778,5 +1103,94 @@ mod test {
         assert_eq!(decrypted, data);
         assert!(success);
         assert!(!store);
+    }
+
+    #[test]
+    fn test_local_secret_round_trip_and_legacy_migration() {
+        use super::*;
+
+        let encrypted = encrypt_local_secret_str("SavedPeer1!", 128).unwrap();
+        assert!(encrypted.starts_with(LOCAL_SECRET_ENC_VERSION));
+        assert!(is_local_secret_encrypted(encrypted.as_bytes()));
+        let (plaintext, decrypted, should_migrate) = decrypt_local_secret_str(&encrypted);
+        assert_eq!(plaintext, "SavedPeer1!");
+        assert!(decrypted);
+        assert!(!should_migrate);
+
+        let legacy = encrypt_str_or_original("SavedPeer1!", "00", 128);
+        let (plaintext, decrypted, should_migrate) = decrypt_local_secret_str(&legacy);
+        assert_eq!(plaintext, "SavedPeer1!");
+        assert!(decrypted);
+        assert!(should_migrate);
+
+        let invalid_current = format!("{}not-valid-base64", LOCAL_SECRET_ENC_VERSION);
+        let (plaintext, decrypted, should_migrate) = decrypt_local_secret_str(&invalid_current);
+        assert!(plaintext.is_empty());
+        assert!(!decrypted);
+        assert!(!should_migrate);
+
+        // Plaintext that merely resembles the storage prefix must still be
+        // encrypted instead of being written through unchanged.
+        let prefix_shaped_plaintext = format!(
+            "{}{}",
+            LOCAL_SECRET_ENC_VERSION,
+            base64::encode(
+                [7u8; LOCAL_SECRET_MIN_ENCODED_BYTES],
+                base64::Variant::Original
+            )
+        );
+        let encrypted = encrypt_local_secret_str(&prefix_shaped_plaintext, 128).unwrap();
+        assert_ne!(encrypted, prefix_shaped_plaintext);
+        assert_eq!(
+            decrypt_local_secret_str(&encrypted).0,
+            prefix_shaped_plaintext
+        );
+
+        let legacy_local_ciphertext = legacy_local_secret_crypt(b"SavedPeer1!", true).unwrap();
+        let legacy_local = LEGACY_LOCAL_SECRET_ENC_VERSION.to_owned()
+            + &base64::encode(legacy_local_ciphertext, base64::Variant::Original);
+        assert!(is_local_secret_encrypted(legacy_local.as_bytes()));
+        let (plaintext, decrypted, should_migrate) = decrypt_local_secret_str(&legacy_local);
+        assert_eq!(plaintext, "SavedPeer1!");
+        assert!(decrypted);
+        assert!(should_migrate);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_local_secret_dpapi_requires_matching_machine_entropy() {
+        use super::*;
+
+        let encrypted =
+            local_secret_crypt_with_entropy(b"machine-bound", b"machine-a", true).unwrap();
+        assert_eq!(
+            local_secret_crypt_with_entropy(&encrypted, b"machine-a", false).unwrap(),
+            b"machine-bound"
+        );
+        assert!(local_secret_crypt_with_entropy(&encrypted, b"machine-b", false).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_raw_smbios_system_uuid() {
+        use super::*;
+
+        let expected = [
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
+        ];
+        let mut table = vec![1, 24, 1, 0, 1, 2, 3, 4];
+        table.extend(expected);
+        table.extend([0, 0]);
+        table.extend([127, 4, 0, 0, 0, 0]);
+        let mut raw = vec![0, 3, 2, 0];
+        raw.extend((table.len() as u32).to_le_bytes());
+        raw.extend(table);
+        assert_eq!(parse_raw_smbios_system_uuid(&raw), Some(expected));
+
+        raw[16..32].fill(0xff);
+        assert_eq!(parse_raw_smbios_system_uuid(&raw), None);
+        raw.truncate(raw.len() - 1);
+        assert_eq!(parse_raw_smbios_system_uuid(&raw), None);
     }
 }
